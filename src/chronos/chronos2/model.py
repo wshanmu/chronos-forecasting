@@ -84,6 +84,7 @@ class Chronos2EncoderOutput(ModelOutput):
     last_hidden_state: torch.Tensor | None = None
     all_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     all_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
+    all_hidden_states: tuple[torch.Tensor, ...] | None = None
 
 
 class Chronos2Encoder(nn.Module):
@@ -139,6 +140,7 @@ class Chronos2Encoder(nn.Module):
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.Tensor | None = None,
         output_attentions: bool = False,
+        output_hidden_states: bool = False,
     ) -> Chronos2EncoderOutput:
         batch_size, seq_length = inputs_embeds.size()[:-1]
 
@@ -156,7 +158,7 @@ class Chronos2Encoder(nn.Module):
 
         all_time_self_attentions: tuple[torch.Tensor, ...] = ()
         all_group_self_attentions: tuple[torch.Tensor, ...] = ()
-
+        all_hidden_states: tuple[torch.Tensor, ...] = () if output_hidden_states else None
         hidden_states = self.dropout(inputs_embeds)
 
         for i, (layer_module) in enumerate(self.block):
@@ -177,6 +179,9 @@ class Chronos2Encoder(nn.Module):
                 all_time_self_attentions = (*all_time_self_attentions, layer_outputs.time_self_attn_weights)
                 all_group_self_attentions = (*all_group_self_attentions, layer_outputs.group_self_attn_weights)
 
+            if output_hidden_states:
+                all_hidden_states = (*all_hidden_states, hidden_states)
+
         hidden_states = self.final_layer_norm(hidden_states)
         hidden_states = self.dropout(hidden_states)
 
@@ -184,6 +189,7 @@ class Chronos2Encoder(nn.Module):
             last_hidden_state=hidden_states,
             all_time_self_attn_weights=all_time_self_attentions,
             all_group_self_attn_weights=all_group_self_attentions,
+            all_hidden_states=all_hidden_states,
         )
 
 
@@ -193,6 +199,11 @@ class Chronos2Output(ModelOutput):
     quantile_preds: torch.Tensor | None = None
     enc_time_self_attn_weights: tuple[torch.Tensor, ...] | None = None
     enc_group_self_attn_weights: tuple[torch.Tensor, ...] | None = None
+
+@dataclass
+class Chronos2ClassificationOutput(ModelOutput):
+    loss: torch.Tensor | None = None
+    logits: torch.Tensor | None = None
 
 
 class Chronos2Model(PreTrainedModel):
@@ -612,6 +623,7 @@ class Chronos2Model(PreTrainedModel):
             inputs_embeds=input_embeds,
             group_ids=group_ids,
             output_attentions=output_attentions,
+            output_hidden_states=True,
         )
         return encoder_outputs, loc_scale, patched_future_covariates_mask, num_context_patches
 
@@ -725,6 +737,257 @@ class Chronos2Model(PreTrainedModel):
                 future_target=future_target,
                 future_target_mask=future_target_mask,
                 patched_future_covariates_mask=patched_future_covariates_mask,
+                loc_scale=loc_scale,
+                num_output_patches=num_output_patches,
+            )
+            if future_target is not None
+            else None
+        )
+
+        # Unscale predictions
+        quantile_preds = rearrange(
+            quantile_preds,
+            "b q h -> b (q h)",
+            b=batch_size,
+            q=self.num_quantiles,
+            h=num_output_patches * self.chronos_config.output_patch_size,
+        )
+        quantile_preds = self.instance_norm.inverse(quantile_preds, loc_scale)
+        quantile_preds = rearrange(
+            quantile_preds,
+            "b (q h) -> b q h",
+            q=self.num_quantiles,
+            h=num_output_patches * self.chronos_config.output_patch_size,
+        )
+
+        return Chronos2Output(
+            loss=loss,
+            quantile_preds=quantile_preds,
+            enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
+            enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
+        )
+
+class Chronos2ModelClassification(Chronos2Model):
+    def __init__(self, config, num_classes: int):
+        super().__init__(config)
+        self.num_classes = num_classes
+        
+        # Remove the forecasting head to save memory/VRAM
+        del self.output_patch_embedding
+        
+        # self.classification_head = nn.Linear((self.model_dim*12 + 2)*8, num_classes) # TODO: verify input dim
+        self.classification_head = nn.Sequential(
+            nn.Linear((self.model_dim*12 + 2)*8, 512),
+            nn.ReLU(),
+            nn.Linear(512, 64),
+            nn.ReLU(),
+            nn.Linear(64, num_classes),
+        )
+
+        # Call the initialization
+        self.post_init_custom()
+
+    def post_init_custom(self):
+        for module in self.classification_head:
+            if isinstance(module, nn.Linear):
+                nn.init.xavier_uniform_(module.weight)
+                if module.bias is not None:
+                    nn.init.zeros_(module.bias)
+    
+    def encode(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        future_covariates: torch.Tensor | None = None,
+        future_covariates_mask: torch.Tensor | None = None,
+        num_output_patches: int = 1,
+        future_target: torch.Tensor | None = None,
+        future_target_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+    ):
+        self._validate_input(
+            context=context,
+            context_mask=context_mask,
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            group_ids=group_ids,
+            num_output_patches=num_output_patches,
+            future_target=future_target,
+            future_target_mask=future_target_mask,
+        )
+
+        batch_size = context.shape[0]
+        patched_context, attention_mask, loc_scale = self._prepare_patched_context(
+            context=context, context_mask=context_mask
+        )
+        num_context_patches = attention_mask.shape[-1]
+
+        # get input embeddings of shape (batch, num_context_patches, d_model)
+        input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
+        # append [REG] special token embedding, if needed
+        if self.chronos_config.use_reg_token:
+            reg_input_ids = torch.full((batch_size, 1), self.config.reg_token_id, device=input_embeds.device)
+            reg_embeds = self.shared(reg_input_ids)
+            input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+            attention_mask = torch.cat(
+                [attention_mask.to(self.dtype), torch.ones_like(reg_input_ids).to(self.dtype)], dim=-1
+            )
+
+        if group_ids is None:
+            # by default, each time series is treated independently, i.e., no mixing across the batch
+            group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
+
+        encoder_outputs: Chronos2EncoderOutput = self.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=input_embeds,
+            group_ids=group_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+        )
+        return encoder_outputs, loc_scale, num_context_patches
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        future_covariates: torch.Tensor | None = None,
+        future_covariates_mask: torch.Tensor | None = None,
+        num_output_patches: int = 1,
+        future_target: torch.Tensor | None = None,
+        future_target_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        labels=None,
+    ) -> Chronos2Output:
+        """Forward pass of the Chronos2 model.
+
+        Parameters
+        ----------
+        context
+            Input tensor of shape (batch_size, context_length) containing the historical values
+        context_mask
+            Binary mask tensor of same shape as context indicating which values are valid (1) vs missing (0)
+            If missing, the context_mask will be automatically constructed based on the NaN values in context.
+        group_ids : torch.Tensor | None, optional
+            Group IDs of shape (batch_size,) indicating which times series in the batch form a group.
+            A group indicates a task, for example, for a batch of size 6:
+            - if groups_ids = [0, 1, 2, 3, 4, 5], each time series is treated independently.
+            - if groups_ids = [0, 0, 1, 1, 1, 2], information is mixed across the first two time series (id=0),
+                the next three time series (id=1) and the last time series is treated separately. Information is
+                NOT shared among time series from different groups.
+            The ordering and specific values of group_ids are not important, all time series with the same group
+            ID form a group.
+        future_covariates
+            Tensor of shape (batch_size, future_length) containing future covariates. Note that the size of
+            tensor along the first axis is equal to the batch_size. This means that future values (which may be NaNs)
+            must be provided for each time series in the batch. For any time series that need to be forecasted, the
+            future_covariates can be set to NaNs, if ``future_covariates_mask`` is omitted or to an arbitrary dummy
+            value when ``future_covariates_mask`` is provided. ``future_covariates`` can be used with ``group_ids``
+            to construct heterogenous forecasting tasks in a single batch. For example:
+            - future_covariates = [[nan, ...], [nan, ...], [v1, ...], [v2, ...], [nan, ...], [nan, ...]]
+            - groups_ids = [0, 0, 1, 1, 1, 2]
+            - future_covariates_mask = None
+            contains 3 types of forecasting tasks:
+            - [0, 0]: The first task, both future_covariates are missing, which implies that the two time series need to
+                be forecasted jointly, i.e., multivariate forecasting.
+            - [1, 1, 1]: In the next task, the first two future_covariates are available and the last one is missing
+                ([v1, ...], [v2, ...], [nan, ...]), where [v1, ...] and [v1, ...] denote an arbitrary sequence of values.
+                This indicates that the first two time series are known covariates and the third one needs to be forecasted
+                by the model.
+            - [2]: The last task has a single time series in the group which needs to be forecasted independently.
+            There is no theoretical limit on the number of time series in a group, i.e., the number of targets and known
+            covariates in a task. The above setup subsumes tasks with past-only covariates as the model's prediction for
+            those time series can simply be ignored downstream.
+        future_covariates_mask
+            Binary mask tensor of same shape as future_covariates indicating which future values are known
+            If omitted, future_covariates_mask is automatically constructed based on future_covariates with
+            all non-NaN values treated as known future values.
+        num_output_patches
+            Number of output patches to generate predictions for, by default 1
+            When ``future_covariates`` and/or ``future_target`` are provided, num_output_patches should be large enough to accommodate
+            their lengths, i.e., num_output_patches * output_patch_size >= future_length
+        future_target
+            Target tensor of shape (batch_size, future_length) used during training. If ``future_covariates`` are provided, both
+            target and future_covariates must have the same shape.
+        future_target_mask
+            Binary mask tensor of same shape as `future_target` indicating which values are valid (1) vs missing (0)
+            If missing, the `future_target_mask` will be automatically constructed based on the NaN values in `future_target`.
+        output_attentions
+            Whether to return attention weights, by default False
+
+        Returns
+        -------
+        Chronos2Output containing:
+        - loss: Training loss, if `future_target` is provided
+        - quantile_preds: Quantile predictions of shape (batch_size, num_quantiles, num_output_patches * output_patch_size).
+            quantile_preds will contain an entry for every time series in the context batch regardless of whether it was a
+            known future covariate.
+        - enc_time_self_attn_weights: Time self attention weights, if output_attentions=True
+        - enc_group_self_attn_weights: Group self attention weights, if output_attentions=True
+        """
+        
+        # context: [bs*num_vars, context_length]
+        # group_ids: [bs*num_vars,] 
+        
+        batch_size = context.shape[0]
+        encoder_outputs, loc_scale, num_context_patches = self.encode(
+            context=context,
+            context_mask=context_mask,
+            group_ids=group_ids,
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            num_output_patches=num_output_patches,
+            future_target=future_target,
+            future_target_mask=future_target_mask,
+            output_attentions=output_attentions,
+        )
+        # loc_scale is the scaling parameters (bs, 2); TODO: add this for better classification performance
+        loc_scale_tensor = torch.cat(loc_scale, dim=-1)
+
+        hidden_states: torch.Tensor = encoder_outputs[0]
+        assert hidden_states.shape == (batch_size, num_context_patches + 1, self.model_dim)
+
+        all_hidden_states = encoder_outputs.all_hidden_states # 12*[B*N, num_patches, d_model]
+
+        # then concatenate num_var such vectors for multivariate classification -> based on group_ids shape (BS,) (what is the sequence?)        
+        # Mean pool each layer across the sequence dimension
+        pooled = [torch.mean(layer, dim=1) for layer in all_hidden_states]
+        combined_features = torch.cat(pooled, dim=-1) # Shape: [batch*num_vars, d_model * 12]
+
+        combined_features_with_statistics = torch.cat([combined_features, loc_scale_tensor], dim=1) # Shape: [batch*num_vars, d_model * 12 + 2]
+        combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
+        
+        # 3. Classification Head
+        logits = self.classification_head(combined_features_with_statistics) # [BS, num_classes]
+        
+        # 4. Loss Calculation (Required for HF Trainer)
+        loss = None
+        if labels is not None:
+            loss_fct = nn.CrossEntropyLoss()
+            loss = loss_fct(logits, labels.long())
+        return Chronos2ClassificationOutput(
+            loss=loss,
+            logits=logits,
+        )
+        
+
+        # slice the last num_output_patches hidden states to be input into the output_patch_embedding
+        forecast_embeds = hidden_states[:, -num_output_patches:]
+        quantile_preds: torch.Tensor = self.output_patch_embedding(forecast_embeds)
+        quantile_preds = rearrange(
+            quantile_preds,
+            "b n (q p) -> b q (n p)",
+            n=num_output_patches,
+            q=self.num_quantiles,
+            p=self.chronos_config.output_patch_size,
+        )
+
+        loss = (
+            self._compute_loss(
+                quantile_preds=quantile_preds,
+                future_target=future_target,
+                future_target_mask=future_target_mask,
                 loc_scale=loc_scale,
                 num_output_patches=num_output_patches,
             )
