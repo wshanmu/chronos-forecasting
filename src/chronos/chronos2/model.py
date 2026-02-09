@@ -251,6 +251,10 @@ class Chronos2Model(PreTrainedModel):
             patch_size=self.chronos_config.input_patch_size, patch_stride=self.chronos_config.input_patch_stride
         )
 
+        self.patch_for_stats = Patch(
+            patch_size=32, patch_stride=32
+        )  # TODO: use chronos2config to set this number, and make it editable by Hydra
+
         # instance normalization, also referred to as "scaling" in Chronos and GluonTS
         self.instance_norm = InstanceNorm(use_arcsinh=self.chronos_config.use_arcsinh)
 
@@ -382,8 +386,11 @@ class Chronos2Model(PreTrainedModel):
                 )
 
     def _prepare_patched_context(
-        self, context: torch.Tensor, context_mask: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+        self, 
+        context: torch.Tensor, 
+        context_mask: torch.Tensor | None = None,
+        return_patch_stats: bool = False  # Default to False for backward compatibility
+    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]] | tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor], torch.Tensor]:
         context_mask = (
             context_mask.to(context.dtype)
             if context_mask is not None
@@ -395,6 +402,9 @@ class Chronos2Model(PreTrainedModel):
         if context_length > self.chronos_config.context_length:
             context = context[..., -self.chronos_config.context_length :]
             context_mask = context_mask[..., -self.chronos_config.context_length :]
+
+        # 1. Capture RAW context for Absolute Sample Statistics ONLY if requested
+        raw_context = context.clone() if return_patch_stats else None
 
         # scaling
         context, loc_scale = self.instance_norm(context)
@@ -431,6 +441,20 @@ class Chronos2Model(PreTrainedModel):
         # concat time encoding, context and mask along the last (feature) dim
         patched_context = torch.cat([context_time_enc, patched_context, patched_mask], dim=-1)
 
+        # 2. Conditional Return Logic
+        if return_patch_stats:
+            # Calculate patch-wise statistics on unscaled data (Stat Augmentation)
+            raw_patched = self.patch_for_stats(raw_context)
+            p_mean = torch.nanmean(raw_patched, dim=-1, keepdim=True)
+            p_std = torch.std(raw_patched, dim=-1, keepdim=True) # Replaced numpy with torch for speed
+            p_min = torch.amin(torch.nan_to_num(raw_patched, nan=float('inf')), dim=-1, keepdim=True)
+            p_max = torch.amax(torch.nan_to_num(raw_patched, nan=float('-inf')), dim=-1, keepdim=True)
+            
+            patch_stats = torch.cat([p_mean, p_std, p_min, p_max], dim=-1).to(self.dtype) # Shape: (batch_size, num_patches, 4)
+            
+            return patched_context, attention_mask, loc_scale, patch_stats
+        
+        # Default behavior: return only the original 3 elements
         return patched_context, attention_mask, loc_scale
 
     def _prepare_patched_future(
@@ -768,16 +792,18 @@ class Chronos2Model(PreTrainedModel):
         )
 
 class Chronos2ModelClassification(Chronos2Model):
-    def __init__(self, config, num_classes: int):
+    def __init__(self, config, num_classes: int, output_all_hidden_states: bool):
         super().__init__(config)
         self.num_classes = num_classes
+        self.output_all_hidden_states = output_all_hidden_states
         
         # Remove the forecasting head to save memory/VRAM
         del self.output_patch_embedding
+        self.context_length = config.chronos_config["context_length"]
         
-        # self.classification_head = nn.Linear((self.model_dim*12 + 2)*8, num_classes) # TODO: verify input dim
+        self.final_dim = (self.model_dim * 12 + 2) * 8 if output_all_hidden_states else (self.model_dim + 2 + self.context_length//32 * 4) * 8
         self.classification_head = nn.Sequential(
-            nn.Linear((self.model_dim*12 + 2)*8, 512),
+            nn.Linear(self.final_dim, 512),
             nn.ReLU(),
             nn.Linear(512, 64),
             nn.ReLU(),
@@ -818,8 +844,8 @@ class Chronos2ModelClassification(Chronos2Model):
         )
 
         batch_size = context.shape[0]
-        patched_context, attention_mask, loc_scale = self._prepare_patched_context(
-            context=context, context_mask=context_mask
+        patched_context, attention_mask, loc_scale, patch_stats = self._prepare_patched_context(
+            context=context, context_mask=context_mask, return_patch_stats=True
         )
         num_context_patches = attention_mask.shape[-1]
 
@@ -845,7 +871,7 @@ class Chronos2ModelClassification(Chronos2Model):
             output_attentions=output_attentions,
             output_hidden_states=True,
         )
-        return encoder_outputs, loc_scale, num_context_patches
+        return encoder_outputs, loc_scale, num_context_patches, patch_stats
 
     def forward(
         self,
@@ -931,7 +957,7 @@ class Chronos2ModelClassification(Chronos2Model):
         # group_ids: [bs*num_vars,] 
         
         batch_size = context.shape[0]
-        encoder_outputs, loc_scale, num_context_patches = self.encode(
+        encoder_outputs, loc_scale, num_context_patches, patch_stats = self.encode(
             context=context,
             context_mask=context_mask,
             group_ids=group_ids,
@@ -942,20 +968,29 @@ class Chronos2ModelClassification(Chronos2Model):
             future_target_mask=future_target_mask,
             output_attentions=output_attentions,
         )
-        # loc_scale is the scaling parameters (bs, 2); TODO: add this for better classification performance
+        # loc_scale is the scaling parameters (bs, 2);
         loc_scale_tensor = torch.cat(loc_scale, dim=-1)
+        # patch_stats is the statistics for each patch, Shape: (batch_size, num_patches, 4)]
+        patch_stats = patch_stats.view(batch_size, -1)
 
         hidden_states: torch.Tensor = encoder_outputs[0]
         assert hidden_states.shape == (batch_size, num_context_patches + 1, self.model_dim)
 
         all_hidden_states = encoder_outputs.all_hidden_states # 12*[B*N, num_patches, d_model]
-
-        # then concatenate num_var such vectors for multivariate classification -> based on group_ids shape (BS,) (what is the sequence?)        
-        # Mean pool each layer across the sequence dimension
         pooled = [torch.mean(layer, dim=1) for layer in all_hidden_states]
-        combined_features = torch.cat(pooled, dim=-1) # Shape: [batch*num_vars, d_model * 12]
+        if self.output_all_hidden_states:
+            # then concatenate num_var such vectors for multivariate classification -> based on group_ids shape (BS,)
+            # Mean pool each layer across the sequence dimension
+            combined_features = torch.cat(pooled, dim=-1) # Shape: [batch*num_vars, d_model * 12]
+        else:
+            combined_features = pooled[-1]
 
-        combined_features_with_statistics = torch.cat([combined_features, loc_scale_tensor], dim=1) # Shape: [batch*num_vars, d_model * 12 + 2]
+        combined_features_with_statistics = torch.cat([combined_features, loc_scale_tensor, patch_stats], dim=1) # Shape: [batch*num_vars, d_model * 12 + 2]
+        
+        ## If we want to mean pool over I/Q per link:
+        # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, 2, 4, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
+        # combined_features_with_statistics = (torch.mean(combined_features_with_statistics, dim=1)).view(batch_size//8, -1)
+        
         combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
         
         # 3. Classification Head
@@ -964,6 +999,8 @@ class Chronos2ModelClassification(Chronos2Model):
         # 4. Loss Calculation (Required for HF Trainer)
         loss = None
         if labels is not None:
+            # loss_fct = nn.CrossEntropyLoss(weight=torch.tensor([0.85, 0.15], device=logits.device))
+            # loss_fct = BinaryFocalLoss(alpha=0.15, gamma=3.0)
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(logits, labels.long())
         return Chronos2ClassificationOutput(
@@ -971,49 +1008,31 @@ class Chronos2ModelClassification(Chronos2Model):
             logits=logits,
         )
         
+import torch.nn.functional as F
+class BinaryFocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super(BinaryFocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
 
-        # slice the last num_output_patches hidden states to be input into the output_patch_embedding
-        forecast_embeds = hidden_states[:, -num_output_patches:]
-        quantile_preds: torch.Tensor = self.output_patch_embedding(forecast_embeds)
-        quantile_preds = rearrange(
-            quantile_preds,
-            "b n (q p) -> b q (n p)",
-            n=num_output_patches,
-            q=self.num_quantiles,
-            p=self.chronos_config.output_patch_size,
-        )
-
-        loss = (
-            self._compute_loss(
-                quantile_preds=quantile_preds,
-                future_target=future_target,
-                future_target_mask=future_target_mask,
-                loc_scale=loc_scale,
-                num_output_patches=num_output_patches,
-            )
-            if future_target is not None
-            else None
-        )
-
-        # Unscale predictions
-        quantile_preds = rearrange(
-            quantile_preds,
-            "b q h -> b (q h)",
-            b=batch_size,
-            q=self.num_quantiles,
-            h=num_output_patches * self.chronos_config.output_patch_size,
-        )
-        quantile_preds = self.instance_norm.inverse(quantile_preds, loc_scale)
-        quantile_preds = rearrange(
-            quantile_preds,
-            "b (q h) -> b q h",
-            q=self.num_quantiles,
-            h=num_output_patches * self.chronos_config.output_patch_size,
-        )
-
-        return Chronos2Output(
-            loss=loss,
-            quantile_preds=quantile_preds,
-            enc_time_self_attn_weights=encoder_outputs.all_time_self_attn_weights,
-            enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
-        )
+    def forward(self, inputs, targets):
+        # inputs: model logits (before sigmoid)
+        # targets: ground truth (0 or 1)
+        
+        # Calculate standard binary cross entropy
+        bce_loss_fucntion = nn.CrossEntropyLoss()
+        bce_loss = bce_loss_fucntion(inputs, targets)
+        
+        # Get the probability of the true class
+        pt = torch.exp(-bce_loss) 
+        
+        # Calculate Focal Loss
+        focal_loss = self.alpha * (1 - pt)**self.gamma * bce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss

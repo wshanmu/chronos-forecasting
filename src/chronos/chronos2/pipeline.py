@@ -9,7 +9,7 @@ import time
 import warnings
 from copy import deepcopy
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Callable, Literal, Mapping, Sequence, List
 
 import numpy as np
 import torch
@@ -26,8 +26,11 @@ from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, TensorOrArray
 from chronos.df_utils import convert_df_input_to_list_of_dicts_input
 from chronos.utils import interpolate_quantiles, weighted_quantile
 
-from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix, roc_auc_score, roc_curve
+from scipy.special import softmax
 import wandb
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 if TYPE_CHECKING:
     import datasets
@@ -368,14 +371,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
     
     def fit_classifier(
         self,
-        inputs: TensorOrArray
-        | Sequence[TensorOrArray]
-        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray | None]]],
-        prediction_length: int,
-        validation_inputs: TensorOrArray
-        | Sequence[TensorOrArray]
-        | Sequence[Mapping[str, TensorOrArray | Mapping[str, TensorOrArray | None]]]
-        | None = None,
+        train_inputs: List[str],
+        validation_inputs: List[str],
         finetune_mode: Literal["full", "lora"] = "full",
         lora_config: "LoraConfig | dict | None" = None,
         context_length: int | None = None,
@@ -383,28 +380,23 @@ class Chronos2Pipeline(BaseChronosPipeline):
         num_steps: int = 1000,
         batch_size: int = 256,
         output_dir: Path | str | None = None,
-        min_past: int | None = None,
         finetuned_ckpt_name: str = "finetuned-ckpt",
         callbacks: list["TrainerCallback"] | None = None,
         remove_printer_callback: bool = False,
         disable_data_parallel: bool = True,
+        num_classes: int = 2,
+        eval_layout_augmentation: bool = False,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         """
-        Fine-tune a copy of the current Chronos-2 model on the given inputs and return a new pipeline.
+        Fine-tune a copy of the current Chronos-2 for classification on the given inputs and return a new pipeline.
 
         Parameters
         ----------
-        inputs
-            The time series on which the model will be fine-tuned. The allowed formats of inputs are the same as `Chronos2Pipeline.predict()`.
-            Note: when `inputs` is a list of dicts, the values inside `future_covariates` are not technically used for training the model;
-            however, this key is used to infer which covariates are known into the future. Therefore, if your task contains known future covariates,
-            make sure that this key exists in `inputs`. The values of individual future covariates may be set to `None` or an empty array.
-        prediction_length
-            The prediction horizon for which the model will be fine-tuned
+        train_inputs
+            list of string identifying which deployments to be train
         validation_inputs
-            The time series used for validation and model selection. The format of `validation_inputs` is exactly the same as `inputs`, by default None which
-            means that no validation is performed. Note that enabling validation may slow down fine-tuning for large datasets.
+            list of string identifying which deployments to be evaluate
         finetune_mode
             One of "full" (performs full fine-tuning) or "lora" (performs Low Rank Adaptation (LoRA) fine-tuning), by default "full"
         lora_config
@@ -423,9 +415,6 @@ class Chronos2Pipeline(BaseChronosPipeline):
             will be lower than this value, by default 256
         output_dir
             The directory in which outputs from the `Trainer` will be saved, by default set to `chronos-2-finetuned/{%Y-%m-%d_%H-%M-%S}`
-        min_past
-            The minimum number of time steps the context must have during fine-tuning. All time series shorter than `min_past + prediction_length`
-            are filtered out, by default set equal to prediction_length
         finetuned_ckpt_name
             The name of the directory inside `output_dir` in which the final fine-tuned checkpoint will be saved, by default "finetuned-ckpt"
         callbacks
@@ -434,6 +423,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             If True, all instances of `PrinterCallback` are removed from callbacks
         disable_data_parallel
             If True, ensures that DataParallel is disabled and training happens on a single GPU
+        eval_layout_augmentation
+            If True, evaluating with 4x samples (augmented with layout shifts) and averaging the logits.
         **extra_trainer_kwargs
             Extra kwargs are directly forwarded to `TrainingArguments`
 
@@ -468,7 +459,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         # Create a copy of the model to avoid modifying the original
         config = deepcopy(self.model.config)
-        model = Chronos2ModelClassification(config, num_classes=2).to(self.model.device)  # TODO: classfication num config
+        config.chronos_config["context_length"] = context_length # Update pretrained model's config, for correct following initialization
+        model = Chronos2ModelClassification(config, num_classes=num_classes, output_all_hidden_states=False).to(self.model.device)
         model.load_state_dict(self.model.state_dict(), strict=False) # allow missing classification head
 
         if finetune_mode == "lora":
@@ -502,10 +494,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             context_length = self.model_context_length
         print("Current context length is", context_length)
 
-        if min_past is None:
-            min_past = prediction_length
-
-        train_manifest = DataManifest('/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir', layouts=['deployment1', 'deployment2', 'deployment3', 'deployment4'])
+        train_manifest = DataManifest('/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir', layouts=train_inputs)
         # Using dataset_params (DictConfig) directly
         train_dataset = SyntheticSignalDataset(
             train_manifest, 
@@ -515,6 +504,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             augment_phase=True,
             augment_time_warp=True,
             min_max_normalization=False,
+            window_size=context_length,
+            stride=256,
         )
 
         if output_dir is None:
@@ -570,21 +561,23 @@ class Chronos2Pipeline(BaseChronosPipeline):
         callbacks = callbacks or []
         if validation_inputs is not None:
             # Test: Synthesis Mode DISABLED
-            test_manifest = DataManifest('/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir', layouts=['deployment5'])
+            test_manifest = DataManifest('/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir', layouts=validation_inputs)
             eval_dataset = SyntheticSignalDataset(
                 test_manifest, 
                 n_channels=4, 
                 synthesis_mode=False, 
-                aug_layout_testing=False,
+                aug_layout_testing=eval_layout_augmentation,
                 min_max_normalization=False,
+                window_size=context_length,
+                stride=256,
             )
 
             # set validation parameters
-            training_kwargs["save_strategy"] = "steps"
-            training_kwargs["save_steps"] = 100
+            # training_kwargs["save_strategy"] = "steps"
+            # training_kwargs["save_steps"] = 100
             training_kwargs["eval_strategy"] = "steps"
             training_kwargs["eval_steps"] = 100
-            training_kwargs["load_best_model_at_end"] = True
+            # training_kwargs["load_best_model_at_end"] = True
             training_kwargs["metric_for_best_model"] = "eval_loss"
             training_kwargs["label_names"] = ["labels"]
 
@@ -606,36 +599,189 @@ class Chronos2Pipeline(BaseChronosPipeline):
             training_args._n_gpu = 1
             assert training_args.n_gpu == 1  # Ensure that the hack worked
 
+        # Capture num_classes from the outer scope
+        params_num_classes = num_classes
+
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
-            # Get the class with the highest logit for each sample
-            predictions = np.argmax(logits, axis=-1)
             
+            # --- Aggregation Logic if enabled ---
+            if eval_layout_augmentation:
+                # We expect 4 predictions per original sample
+                # Input shapes: [N_total, C], [N_total] where N_total = 4 * N_real
+                N_total, C = logits.shape
+                assert N_total % 4 == 0, f"Expected total samples to be divisible by 4, got {N_total}"
+                
+                # Reshape to group the 4 views: [N_real, 4, C]
+                logits_grouped = logits.reshape(-1, 4, C)
+                labels_grouped = labels.reshape(-1, 4)
+                
+                # Average logits
+                logits_for_pred = np.mean(logits_grouped, axis=1) # [N_real, C]
+                labels_for_pred = labels_grouped[:, 0]            # [N_real]
+            else:
+                logits_for_pred = logits
+                labels_for_pred = labels
+            # ------------------------------------
+
+            # Get the class with the highest logit for each sample
+            predictions = np.argmax(logits_for_pred, axis=-1)
+            
+            # Identify Wrong Samples
+            wrong_indices = np.where(predictions != labels_for_pred)[0]
+            
+            if len(wrong_indices) > 0:
+                
+                # Define log file path
+                log_file_path = output_dir / "error_log.txt"
+                
+                try:
+                    with open(log_file_path, "a") as f:
+                        f.write(f"\n--- Evaluation Step (Total Errors: {len(wrong_indices)}) ---\n")
+                        
+                        for i, idx in enumerate(wrong_indices):
+                            # Map back to dataset index
+                            if eval_layout_augmentation:
+                                # each prediction corresponds to a block of 4 in dataset
+                                dataset_idx = idx * 4
+                            else:
+                                dataset_idx = idx
+                                
+                            # Retrieve Recipe
+                            recipe_info = "Recipe unavailable"
+                            if eval_dataset is not None and hasattr(eval_dataset, 'recipes'):
+                                try:
+                                    # recipes list might be huge, accessing by index is safe
+                                    recipe = eval_dataset.recipes[dataset_idx]
+                                    # Recipe: ([(file, start_idx)...], slice_idx, shift, label_bits)
+                                    ingredients, slice_idx, shift, label_bits = recipe
+                                    recipe_info = (f"Ingredients: {ingredients}, Slice: {slice_idx}, "
+                                                   f"Shift: {shift}, LabelBits: {label_bits}")
+                                except Exception as e:
+                                    recipe_info = f"Error retrieving recipe: {e}"
+                            
+                            # Construct message
+                            msg = (f"[Error {i+1}] Global Idx: {dataset_idx} (AggIdx: {idx}) | "
+                                   f"Pred: {predictions[idx]} | Label: {labels_for_pred[idx]} | "
+                                   f"{recipe_info}")
+                            
+                            # Write to file
+                            f.write(msg + "\n")
+                                
+                except Exception as e:
+                    print(f"Warning: Failed to write error log to {log_file_path}: {e}")
+
             # Basic Metrics
-            acc = accuracy_score(labels, predictions)
-            f1 = f1_score(labels, predictions, average='weighted')
+            acc = accuracy_score(labels_for_pred, predictions)
+            f1 = f1_score(labels_for_pred, predictions, average='weighted')
             
             # Confusion Matrix (Standardized for Binary; can be adapted for Multi-class)
             # For binary classification (0 and 1):
-            if logits.shape[-1] == 2:
-                tn, fp, fn, tp = confusion_matrix(labels, predictions).ravel()
+            if logits_for_pred.shape[-1] == 2:
+                tn, fp, fn, tp = confusion_matrix(labels_for_pred, predictions).ravel()
             else:
                 # For multi-class, these represent the sum across all classes
-                cm = confusion_matrix(labels, predictions)
+                cm = confusion_matrix(labels_for_pred, predictions)
                 tp = np.diag(cm).sum()
                 fp = (cm.sum(axis=0) - np.diag(cm)).sum()
                 fn = (cm.sum(axis=1) - np.diag(cm)).sum()
                 tn = cm.sum() - (tp + fp + fn)
 
+            # ROC AUC Score & Best Threshold Search
+            # Apply softmax to get probabilities
+            probs = softmax(logits_for_pred, axis=-1)
+            
+            best_acc = 0.0
+            best_thresh = 0.5
+            auc = float('nan')
+
+            try:
+                if params_num_classes == 2:
+                     # For binary case, use the probability of the positive class (column 1)
+                    y_prob = probs[:, 1]
+                    auc = roc_auc_score(labels_for_pred, y_prob)
+
+                    # Find best threshold
+                    # We can use roc_curve to get candidate thresholds
+                    fpr, tpr, thresholds = roc_curve(labels_for_pred, y_prob)
+                    
+                    # Evaluate accuracy for each threshold
+                    accuracies = []
+                    for thresh in thresholds:
+                        y_pred_thresh = (y_prob >= thresh).astype(int)
+                        accuracies.append(accuracy_score(labels_for_pred, y_pred_thresh))
+                    
+                    # Argmax
+                    best_idx = np.argmax(accuracies)
+                    best_acc = accuracies[best_idx]
+                    best_thresh = thresholds[best_idx]
+                    
+                    print(f"Best Threshold: {best_thresh:.4f}, Best Accuracy: {best_acc:.4f}")
+
+                    # Visualization
+                    try: 
+                        plt.figure(figsize=(6, 3))
+                        
+                        # Indices for classes
+                        idx_0 = (labels_for_pred == 0)
+                        idx_1 = (labels_for_pred == 1)
+                        
+                        # Twin axis for KDE
+                        ax1 = plt.gca()
+                        ax2 = ax1.twinx()
+                        
+                        # Plot KDE on secondary axis
+                        # Use fill=True (replacement for shade=True which is deprecated)
+                        sns.kdeplot(y_prob[idx_1], color='blue', fill=True, alpha=0.2, ax=ax2, label='Density (Class 1)')
+                        sns.kdeplot(y_prob[idx_0], color='orange', fill=True, alpha=0.2, ax=ax2, label='Density (Class 0)')
+                        ax2.set_ylabel('Density')
+                        
+                        # Plot Scatter on primary axis
+                        ax1.scatter(y_prob[idx_1], labels_for_pred[idx_1], color='blue', alpha=0.5, label='Class 1')
+                        ax1.scatter(y_prob[idx_0], labels_for_pred[idx_0], color='orange', alpha=0.5, label='Class 0')
+                        
+                        ax1.axvline(x=best_thresh, color='red', linestyle='--', label=f'Threshold: {best_thresh:.4f}')
+                        
+                        ax1.set_xlim(0, 1)
+                        ax1.set_ylim(-0.1, 1.1)
+                        ax1.set_yticks([0, 1])  # Only show 0 and 1
+                        ax1.set_xlabel('Predicted Probability')
+                        ax1.set_ylabel('Ground Truth Label')
+                        plt.title(f'Logits Distribution & Optimal Threshold (Acc: {best_acc:.4f})')
+                        
+                        # Combine legends
+                        lines, labels = ax1.get_legend_handles_labels()
+                        lines2, labels2 = ax2.get_legend_handles_labels()
+                        # Move legend inside: loc='center right'
+                        ax1.legend(lines, labels, loc='center right')
+                        
+                        plt.tight_layout()
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        save_path = Path(output_dir) / f"prob_dist_{timestamp}.png"
+                        plt.savefig(save_path, dpi=250)
+                        plt.close()
+                        print(f"Visualization saved to {save_path}")
+                    except Exception as e:
+                        print(f"Warning: Failed to create visualization: {e}")
+
+                else:
+                    # For multi-class, use one-vs-rest strategy
+                    auc = roc_auc_score(labels_for_pred, probs, multi_class='ovr')
+            except ValueError as e:
+                 print(f"Warning: Could not calculate AUC or Threshold: {e}")
+
             # Log the matrix specifically to W&B
             if "wandb" in training_args.report_to:
                 wandb.log({"conf_mat": wandb.plot.confusion_matrix(probs=None,
-                                y_true=labels, preds=predictions,
+                                y_true=labels_for_pred, preds=predictions,
                                 class_names=["Empty", "Occupied"])})
 
             return {
                 "accuracy": acc,
                 "f1": f1,
+                "auc": auc,
+                "best_accuracy": best_acc,
+                "best_threshold": best_thresh,
                 "tp": float(tp),
                 "fp": float(fp),
                 "fn": float(fn),
@@ -643,7 +789,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             }
 
         # fit entry point to trainer
-        collate_fn = ChronosClassificationCollate(context_length=512)
+        collate_fn = ChronosClassificationCollate(context_length=context_length)
         trainer = Trainer(
             model=model,
             args=training_args,
@@ -661,19 +807,16 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         # update context_length and max_output_patches, if the model was fine-tuned with larger values
         model.chronos_config.context_length = max(model.chronos_config.context_length, context_length)
-        model.chronos_config.max_output_patches = max(
-            model.chronos_config.max_output_patches, math.ceil(prediction_length / self.model_output_patch_size)
-        )
         # update chronos_config in model's config, so it is saved correctly
         model.config.chronos_config = model.chronos_config.__dict__
 
         # Create a new pipeline with the fine-tuned model
         finetuned_pipeline = Chronos2Pipeline(model=model)
 
-        # Save fine-tuned model
-        finetuned_path = output_dir / finetuned_ckpt_name
-        finetuned_pipeline.save_pretrained(finetuned_path)
-        logger.info(f"Finetuned model saved to {finetuned_path}")
+        # # Save fine-tuned model
+        # finetuned_path = output_dir / finetuned_ckpt_name
+        # finetuned_pipeline.save_pretrained(finetuned_path)
+        # logger.info(f"Finetuned model saved to {finetuned_path}")
 
         if training_kwargs["tf32"]:
             # restore tf32 settings
