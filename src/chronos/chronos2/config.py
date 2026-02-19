@@ -110,6 +110,10 @@ class Chronos2ForecastingConfig:
     use_arcsinh: bool = False
     max_output_patches: int = 1
     time_encoding_scale: int | None = None
+    patch_size_stats: int = 32
+    patch_stride_stats: int = 32
+    train_loss: str = 'cross_entropy'
+    output_all_hidden_states: bool = False
 
     @classmethod
     def editable_fields(cls) -> list[str]:

@@ -790,10 +790,17 @@ class SyntheticSignalDataset(Dataset):
                  max_recipes: int = None,
                  stack_complex: bool = True,
                  synthesis_mode: bool = True,
+                 aug_layout_training: bool = True,
                  aug_layout_testing: bool = False,
                  augment_phase: bool = False,
+                 augment_phase_step: int = 60,
                  augment_time_warp: bool = False,
-                 min_max_normalization: bool = True):
+                 time_warp_num_knots: int = 6,
+                 time_warp_strength: float = 15.0,
+                 blending_alpha_enabled: bool = True,
+                 blending_alpha_range: Tuple[float, float] = (0.1, 1.1),
+                 min_max_normalization: bool = True,
+                 convert_complex_to_float: str = "I_Q"):
         """
         Args:
             manifest: Populated DataManifest.
@@ -809,17 +816,36 @@ class SyntheticSignalDataset(Dataset):
                 If True during testing, applies shifts to simulate layout augmentation.
             augment_phase:
                 If True, applies random phase rotation augmentations during synthesis.
+            augment_phase_step:
+                Number of steps for phase augmentation (k * 2pi / step).
             augment_time_warp:
                 If True, applies random time warping augmentations during synthesis.
+            time_warp_num_knots:
+                Number of knots for time warping spline.
+            time_warp_strength:
+                Strength of time warping (std dev of offsets).
+            blending_alpha_enabled:
+                If True, applies random alpha blending when mixing signals.
+            blending_alpha_range:
+                Range for random alpha blending factor (min, max).
+            convert_complex_to_float:
+                "I_Q" (default) or "mag_phase".
         """
         self.n_channels = n_channels
         self.window_size = window_size
         self.stride = stride
         self.stack_complex = stack_complex
         self.aug_layout_testing = aug_layout_testing
+        self.aug_layout_training = aug_layout_training
         self.synthesis_mode = synthesis_mode
         self.augment_phase = augment_phase
+        self.augment_phase_step = augment_phase_step
         self.augment_time_warp = augment_time_warp
+        self.time_warp_num_knots = time_warp_num_knots
+        self.time_warp_strength = time_warp_strength
+        self.blending_alpha_enabled = blending_alpha_enabled
+        self.blending_alpha_range = blending_alpha_range
+        self.convert_complex_to_float = convert_complex_to_float
         self.recipes: List[Recipe] = []
         self.min_max_normalization = min_max_normalization
         self.manifest = manifest
@@ -918,10 +944,14 @@ class SyntheticSignalDataset(Dataset):
                         combo_label_int = sum(bit_vals)
                         new_label_bits = format(combo_label_int, '04b')
                         
-                        for shift in range(self.n_channels):
+                        if self.aug_layout_training:
+                            for shift in range(self.n_channels):
+                                for slice_idx in range(4):
+                                    # seg_combo is already a tuple of (file, start), which fits our Recipe def
+                                    self.recipes.append((seg_combo, slice_idx, shift, new_label_bits))
+                        else:
                             for slice_idx in range(4):
-                                # seg_combo is already a tuple of (file, start), which fits our Recipe def
-                                self.recipes.append((seg_combo, slice_idx, shift, new_label_bits))
+                                self.recipes.append((seg_combo, slice_idx, 0, new_label_bits))
 
         
         if max_recipes and len(self.recipes) > max_recipes:
@@ -1014,7 +1044,7 @@ class SyntheticSignalDataset(Dataset):
         
         # 2. Generate Random Flow Field
         # We define a few 'knots' (anchors) and perturb them
-        num_knots = 6 
+        num_knots = self.time_warp_num_knots
         # Original time points for knots (e.g., 0, 100, 200, ... 512)
         orig_knots = np.linspace(0, T-1, num_knots)
         
@@ -1075,30 +1105,40 @@ class SyntheticSignalDataset(Dataset):
             signal_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
 
             if self.augment_phase: 
-                # Select random integer k from [0, 59]
-                k = np.random.randint(0, 60)
+                # Select random integer k from [0, augment_phase_step-1]
+                step = self.augment_phase_step
+                k = np.random.randint(0, step)
                 
                 # Compute theta and the complex phasor
-                theta = k * (np.pi / 30)
+                theta = k * (2 * np.pi / step) # Changed to 2pi/step to cover full circle if step is large enough, or use pi/30 logic if that was specific.
+                # The user requirement said: augment_phase_step: 60 # k*2pi/step, k in range(0, augment_phase_step)
+                # Wait, usually it's k * (2 * np.pi / step).
+                # Original code: k = randint(0, 60), theta = k * (pi / 30). pi/30 = 2pi/60. So it covers 0 to 2pi.
+                # So the formula is k * (2 * np.pi / step).
+                
                 phasor = np.exp(1j * theta)
                 
                 # Apply rotation: signal * e^(j*theta)
                 signal_slice = (signal_slice * phasor).astype(np.complex64)
             
             if self.augment_time_warp:
-                signal_slice = self._apply_time_warp(signal_slice, strength=12.0)
+                signal_slice = self._apply_time_warp(signal_slice, strength=self.time_warp_strength)
             
             if synthesized_signal is None:
                 synthesized_signal = signal_slice
             else:
-                synthesized_signal += signal_slice
+                blending_alpha = 1.0
+                if self.blending_alpha_enabled:
+                    low, high = self.blending_alpha_range
+                    blending_alpha = np.random.uniform(low, high)
+                synthesized_signal += blending_alpha * signal_slice
         
         # 2. Augmentation (Circular Shift)
         # In Test Mode: shift is 0, so this block does nothing.
         if shift > 0:
             synthesized_signal = np.roll(synthesized_signal, shift, axis=0)
 
-        # average across the selected bins (last axis)
+        # average across the selected bins (last axis) # TODO: determine if mean pooling or max pooling
         synthesized_signal = np.mean(synthesized_signal, axis=-1)  # Now [C, T]
 
         # Optional: Normalization
@@ -1107,9 +1147,15 @@ class SyntheticSignalDataset(Dataset):
 
         # 3. Complex Handling & Tensor Conversion
         if self.stack_complex:
-            real = torch.from_numpy(synthesized_signal.real)
-            imag = torch.from_numpy(synthesized_signal.imag)
-            tensor_sig = torch.stack([real, imag], dim=1).reshape(-1, *real.shape[1:]) # stack I/Q interleaved
+            if self.convert_complex_to_float == "mag_phase":
+                mag = torch.from_numpy(np.abs(synthesized_signal))
+                angle = torch.from_numpy(np.angle(synthesized_signal))
+                tensor_sig = torch.stack([mag, angle], dim=1).reshape(-1, *mag.shape[1:]) # stack mag/phase interleaved
+            else:
+                # Default "I_Q"
+                real = torch.from_numpy(synthesized_signal.real)
+                imag = torch.from_numpy(synthesized_signal.imag)
+                tensor_sig = torch.stack([real, imag], dim=1).reshape(-1, *real.shape[1:]) # stack I/Q interleaved
         else:
             tensor_sig = torch.from_numpy(synthesized_signal)
             

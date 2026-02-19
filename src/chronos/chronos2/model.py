@@ -251,9 +251,11 @@ class Chronos2Model(PreTrainedModel):
             patch_size=self.chronos_config.input_patch_size, patch_stride=self.chronos_config.input_patch_stride
         )
 
+        patch_size_stats = self.chronos_config.__dict__.get("patch_size_stats", 32)
+        patch_stride_stats = self.chronos_config.__dict__.get("patch_stride_stats", 32)
         self.patch_for_stats = Patch(
-            patch_size=32, patch_stride=32
-        )  # TODO: use chronos2config to set this number, and make it editable by Hydra
+            patch_size=patch_size_stats, patch_stride=patch_stride_stats
+        )
 
         # instance normalization, also referred to as "scaling" in Chronos and GluonTS
         self.instance_norm = InstanceNorm(use_arcsinh=self.chronos_config.use_arcsinh)
@@ -792,22 +794,25 @@ class Chronos2Model(PreTrainedModel):
         )
 
 class Chronos2ModelClassification(Chronos2Model):
-    def __init__(self, config, num_classes: int, output_all_hidden_states: bool):
+    def __init__(self, config, n_classes: int, output_all_hidden_states: bool, n_channels: int = 8):
         super().__init__(config)
-        self.num_classes = num_classes
+        self.num_classes = n_classes
         self.output_all_hidden_states = output_all_hidden_states
+        self.n_channels = n_channels
         
         # Remove the forecasting head to save memory/VRAM
         del self.output_patch_embedding
         self.context_length = config.chronos_config["context_length"]
-        
-        self.final_dim = (self.model_dim * 12 + 2) * 8 if output_all_hidden_states else (self.model_dim + 2 + self.context_length//32 * 4) * 8
+        if output_all_hidden_states:
+            self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
+        else:
+            self.final_dim = (self.model_dim + 2 + self.context_length//32 * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
         self.classification_head = nn.Sequential(
             nn.Linear(self.final_dim, 512),
             nn.ReLU(),
             nn.Linear(512, 64),
             nn.ReLU(),
-            nn.Linear(64, num_classes),
+            nn.Linear(64, n_classes),
         )
 
         # Call the initialization
@@ -991,7 +996,7 @@ class Chronos2ModelClassification(Chronos2Model):
         # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, 2, 4, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
         # combined_features_with_statistics = (torch.mean(combined_features_with_statistics, dim=1)).view(batch_size//8, -1)
         
-        combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
+        combined_features_with_statistics = combined_features_with_statistics.view(batch_size // self.n_channels, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
         
         # 3. Classification Head
         logits = self.classification_head(combined_features_with_statistics) # [BS, num_classes]
@@ -999,9 +1004,14 @@ class Chronos2ModelClassification(Chronos2Model):
         # 4. Loss Calculation (Required for HF Trainer)
         loss = None
         if labels is not None:
-            # loss_fct = nn.CrossEntropyLoss(weight=torch.tensor([0.85, 0.15], device=logits.device))
-            # loss_fct = BinaryFocalLoss(alpha=0.15, gamma=3.0)
-            loss_fct = nn.CrossEntropyLoss()
+            train_loss_type = self.chronos_config.__dict__.get("train_loss", "cross_entropy")
+            if train_loss_type == "cross_entropy":
+                loss_fct = nn.CrossEntropyLoss()
+            elif train_loss_type == "focal_loss":
+                loss_fct = BinaryFocalLoss(alpha=0.25, gamma=2.0)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+
             loss = loss_fct(logits, labels.long())
         return Chronos2ClassificationOutput(
             loss=loss,

@@ -377,6 +377,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
         lora_config: "LoraConfig | dict | None" = None,
         context_length: int | None = None,
         learning_rate: float = 1e-6,
+        lr_scheduler_type: str = "cosine",
+        warmup_ratio: float = 0.05,
         num_steps: int = 1000,
         batch_size: int = 256,
         output_dir: Path | str | None = None,
@@ -384,8 +386,12 @@ class Chronos2Pipeline(BaseChronosPipeline):
         callbacks: list["TrainerCallback"] | None = None,
         remove_printer_callback: bool = False,
         disable_data_parallel: bool = True,
-        num_classes: int = 2,
+        n_classes: int = 2,
+        n_channels: int = 8,
         eval_layout_augmentation: bool = False,
+        train_weighted_sampler: bool = False,
+        dataset_kwargs: dict = None,
+        model_update_kwargs: dict = None,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         """
@@ -460,7 +466,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
         # Create a copy of the model to avoid modifying the original
         config = deepcopy(self.model.config)
         config.chronos_config["context_length"] = context_length # Update pretrained model's config, for correct following initialization
-        model = Chronos2ModelClassification(config, num_classes=num_classes, output_all_hidden_states=False).to(self.model.device)
+        
+        output_all_hidden_states = False
+        if model_update_kwargs:
+            config.chronos_config.update(model_update_kwargs)
+            output_all_hidden_states = model_update_kwargs.get("output_all_hidden_states", False)
+            
+        model = Chronos2ModelClassification(config, n_classes=n_classes, output_all_hidden_states=output_all_hidden_states, n_channels=n_channels).to(self.model.device)
         model.load_state_dict(self.model.state_dict(), strict=False) # allow missing classification head
 
         if finetune_mode == "lora":
@@ -494,19 +506,56 @@ class Chronos2Pipeline(BaseChronosPipeline):
             context_length = self.model_context_length
         print("Current context length is", context_length)
 
-        train_manifest = DataManifest('/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir', layouts=train_inputs)
+        dataset_kwargs = dataset_kwargs or {}
+        # extract 'root' from dataset_kwargs if it exists, else use the hardcoded path.
+        dataset_root = dataset_kwargs.pop('root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir')
+
+        train_manifest = DataManifest(dataset_root, layouts=train_inputs)
         # Using dataset_params (DictConfig) directly
         train_dataset = SyntheticSignalDataset(
-            train_manifest, 
+            train_manifest,
             n_channels=4, 
-            synthesis_mode=True, 
-            max_recipes=20000, 
-            augment_phase=True,
-            augment_time_warp=True,
-            min_max_normalization=False,
+            synthesis_mode=dataset_kwargs.get("training_synthesis_mode", True), 
+            aug_layout_training=dataset_kwargs.get("train_augment_layout", True),
+            max_recipes=dataset_kwargs.get("train_max_recipe", 20000), 
+            augment_phase=dataset_kwargs.get("train_augment_phase", True),
+            augment_phase_step=dataset_kwargs.get("augment_phase_step", 60),
+            augment_time_warp=dataset_kwargs.get("train_augment_time_warp", True),
+            time_warp_num_knots=dataset_kwargs.get("time_warp_num_knots", 6),
+            time_warp_strength=dataset_kwargs.get("time_warp_strength", 12.0),
+            blending_alpha_enabled=dataset_kwargs.get("blending_alpha", True),
+            blending_alpha_range=dataset_kwargs.get("blending_alpha_range", (0.1, 1.1)),
+            min_max_normalization=dataset_kwargs.get("dataset_min_max_norm", False),
             window_size=context_length,
-            stride=256,
+            stride=dataset_kwargs.get("stride", 256),
+            convert_complex_to_float=dataset_kwargs.get("convert_complex_to_float", "I_Q"),
         )
+
+        sampler = None
+        if train_weighted_sampler:
+            from torch.utils.data import WeightedRandomSampler
+            targets = []
+            for _, slice_idx, _, label_bits in train_dataset.recipes:
+                target = 1 if label_bits[slice_idx] == '1' else 0
+                targets.append(target)
+            
+            targets = torch.tensor(targets, dtype=torch.long)
+            
+            # B. Calculate weight for each class
+            # Weight = 1 / count
+            class_counts = torch.bincount(targets)
+            # Handle edge case if a class is missing (count=0)
+            class_weights = 1. / torch.max(class_counts.float(), torch.tensor(1.0))
+            
+            # C. Assign weight to each sample
+            sample_weights = class_weights[targets]
+            
+            # D. Create the sampler
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True # allows oversampling minority class
+            )
 
         if output_dir is None:
             output_dir = Path("chronos-2-finetuned") / time.strftime("%Y-%m-%d_%H-%M-%S")
@@ -532,8 +581,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             per_device_train_batch_size=batch_size,
             per_device_eval_batch_size=batch_size,
             learning_rate=learning_rate,
-            lr_scheduler_type="linear",
-            warmup_ratio=0.0,
+            lr_scheduler_type=lr_scheduler_type,
+            warmup_ratio=warmup_ratio,
             optim="adamw_torch_fused",
             logging_strategy="steps",
             logging_steps=100,
@@ -561,11 +610,11 @@ class Chronos2Pipeline(BaseChronosPipeline):
         callbacks = callbacks or []
         if validation_inputs is not None:
             # Test: Synthesis Mode DISABLED
-            test_manifest = DataManifest('/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir', layouts=validation_inputs)
+            test_manifest = DataManifest(dataset_root, layouts=validation_inputs)
             eval_dataset = SyntheticSignalDataset(
                 test_manifest, 
                 n_channels=4, 
-                synthesis_mode=False, 
+                synthesis_mode=dataset_kwargs.get("test_synthesis_mode", False), 
                 aug_layout_testing=eval_layout_augmentation,
                 min_max_normalization=False,
                 window_size=context_length,
@@ -600,7 +649,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             assert training_args.n_gpu == 1  # Ensure that the hack worked
 
         # Capture num_classes from the outer scope
-        params_num_classes = num_classes
+        params_num_classes = n_classes
 
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
@@ -790,7 +839,28 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         # fit entry point to trainer
         collate_fn = ChronosClassificationCollate(context_length=context_length)
-        trainer = Trainer(
+        
+        # Define a custom Trainer to use the WeightedRandomSampler
+        class WeightedTrainer(Trainer):
+            def get_train_dataloader(self) -> DataLoader:
+                if self.train_dataset is None:
+                    raise ValueError("Trainer: training requires a train_dataset.")
+                
+                # Use standard Dataloader with our custom sampler
+                # Note: shuffle must be False when sampler is used
+                return DataLoader(
+                    self.train_dataset,
+                    batch_size=self.args.train_batch_size,
+                    sampler=sampler, 
+                    collate_fn=self.data_collator,
+                    drop_last=self.args.dataloader_drop_last,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+
+        TrainerClass = WeightedTrainer if train_weighted_sampler else Trainer
+
+        trainer = TrainerClass(
             model=model,
             args=training_args,
             train_dataset=train_dataset,
