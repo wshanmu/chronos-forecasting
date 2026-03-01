@@ -707,7 +707,7 @@ class DataManifest:
     """
     Handles file discovery, splitting, and shape caching.
     """
-    def __init__(self, root_dir: str, layouts: Optional[List[str]] = None):
+    def __init__(self, root_dir: str, layouts: Optional[List[str]] = None, lpf_cutoff: Optional[float] = None):
         # Structure: layout_name -> { label_str -> [file_paths] }
         self.layout_buckets: Dict[str, Dict[str, List[str]]] = {}
         self.shape_cache: Dict[str, Tuple[int, ...]] = {} 
@@ -721,6 +721,10 @@ class DataManifest:
             if layouts is not None and layout_name not in layouts:
                 continue
 
+            # Filter by lpf_cutoff if provided
+            if lpf_cutoff is not None and f"lpf{lpf_cutoff}" not in fpath:
+                continue
+
             # Ensure layout bucket exists
             if layout_name not in self.layout_buckets:
                 self.layout_buckets[layout_name] = {}
@@ -732,7 +736,14 @@ class DataManifest:
             if label_str not in self.layout_buckets[layout_name]:
                 self.layout_buckets[layout_name][label_str] = []
             self.layout_buckets[layout_name][label_str].append(fpath)
-    
+
+        # Cache num_chairs per layout (= length of any label string in that layout)
+        self.num_chairs_per_layout: Dict[str, int] = {
+            layout: len(next(iter(labels)))
+            for layout, labels in self.layout_buckets.items()
+            if labels
+        }
+
     def get_file_shape(self, fpath: str) -> Tuple[int, ...]:
         if fpath in self.shape_cache: return self.shape_cache[fpath]
         try:
@@ -745,31 +756,33 @@ class DataManifest:
     def _get_label_str(self, path: str) -> str:
         """
         Parses the filename to identify which chairs are present and returns
-        a 4-bit string representation (e.g., '1011' for Chair 1, 3, and 4).
+        an N-bit string representation, where N is the number of chairs in the
+        deployment (e.g. '101100' for a 6-chair deployment with chairs 1, 3, 4).
+
+        Chair count detection (in order):
+          1. Filename contains "XDesks" (case-insensitive) -> num_chairs = X.
+          2. Fallback: num_chairs = 4.
         """
-        # 1. Normalize to lowercase to handle 'Chair1' vs 'chair1' safely
         path_lower = path.lower()
 
-        # 2. Find the segment starting with 'chair' followed by digits/underscores
-        # Pattern explanation:
-        # chair   -> looks for the literal string "chair"
-        # ([\d_]+)-> captures the group of digits and underscores immediately following it
+        # 1. Detect number of chairs from filename hints: e.g. '6Desks', '5Desks'
+        desk_match = re.search(r'(\d+)desks', path_lower)
+        if desk_match:
+            num_chairs = int(desk_match.group(1))
+        else:
+            num_chairs = 4  # default fallback
+
+        # 2. Find 'chair' followed by digits/underscores
         match = re.search(r'chair([\d_]+)', path_lower)
-
         if match:
-            # Extract the suffix part (e.g., '1', '1_3_4', '1_4')
             chair_suffix = match.group(1)
-            
-            # 3. Check for the presence of specific digits within that suffix
-            c1 = '1' if '1' in chair_suffix else '0'
-            c2 = '1' if '2' in chair_suffix else '0'
-            c3 = '1' if '3' in chair_suffix else '0'
-            c4 = '1' if '4' in chair_suffix else '0'
-            
-            return f"{c1}{c2}{c3}{c4}"
+            # Build N-bit string: bit i is '1' if chair (i+1) appears in the suffix
+            bits = ''.join('1' if str(i) in chair_suffix else '0'
+                           for i in range(1, num_chairs + 1))
+            return bits
 
-        Warnings.warn(f"Could not determine label for path: {path}, defaulting to '0000'")
-        return '0000'
+        Warnings.warn(f"Could not determine label for path: {path}, defaulting to all zeros")
+        return '0' * num_chairs
 
     def get_layouts(self) -> List[str]:
         return list(self.layout_buckets.keys())
@@ -800,7 +813,10 @@ class SyntheticSignalDataset(Dataset):
                  blending_alpha_enabled: bool = True,
                  blending_alpha_range: Tuple[float, float] = (0.1, 1.1),
                  min_max_normalization: bool = True,
-                 convert_complex_to_float: str = "I_Q"):
+                 convert_complex_to_float: str = "I_Q",
+                 range_gating_width: int = 5,
+                 augment_range_gating_offset: bool = False,
+                 desk: Optional[List[List[int]]] = None):
         """
         Args:
             manifest: Populated DataManifest.
@@ -830,6 +846,13 @@ class SyntheticSignalDataset(Dataset):
                 Range for random alpha blending factor (min, max).
             convert_complex_to_float:
                 "I_Q" (default) or "mag_phase".
+            range_gating_width:
+                Width of the range gating window (number of bins to keep around the center).
+            augment_range_gating_offset:
+                If True, applies a random offset in [-1, 0, 1] to the center index per channel.
+            desk:
+                List of lists of integers specifying which desks to use for each layout. 
+                If None, uses all. If a layout's list is empty ([]), uses all for that layout.
         """
         self.n_channels = n_channels
         self.window_size = window_size
@@ -848,7 +871,10 @@ class SyntheticSignalDataset(Dataset):
         self.convert_complex_to_float = convert_complex_to_float
         self.recipes: List[Recipe] = []
         self.min_max_normalization = min_max_normalization
+        self.range_gating_width = range_gating_width
+        self.augment_range_gating_offset = augment_range_gating_offset
         self.manifest = manifest
+        self.desk = desk
         
         # --- Mode Switching ---
         if synthesis_mode:
@@ -879,7 +905,7 @@ class SyntheticSignalDataset(Dataset):
         Linear scan: No mixing, no shifts. Just the raw data.
         Returns whatever is in the folder.
         """
-        for layout in manifest.get_layouts():
+        for layout_idx, layout in enumerate(manifest.get_layouts()):
             # Get all labels/files in this layout
             labels = manifest.layout_buckets[layout].keys()
             for lbl in labels:
@@ -889,12 +915,16 @@ class SyntheticSignalDataset(Dataset):
                     # Get all segments for this file
                     segments = self._get_file_segments(fpath)
 
-                    # Each file contains 4 samples (slices 0-3)
-                    # Label bits (e.g. '1000') describe these 4 samples.
-                    for slice_idx in range(4):
+                    # Each file contains num_chairs samples (slices 0..num_chairs-1)
+                    # Label bits (e.g. '1000' or '100010') describe these slices.
+                    num_chairs = manifest.num_chairs_per_layout.get(layout, 4)
+                    for slice_idx in range(num_chairs):
+                        if self.desk is not None and layout_idx < len(self.desk):
+                            if len(self.desk[layout_idx]) > 0 and (slice_idx + 1) not in self.desk[layout_idx]:
+                                continue
                         # Recipe:
                         # 1. File List: Just this one file, but with multiple segments
-                        # 2. Slice: The current index (0-3)
+                        # 2. Slice: The current index
                         # 3. Shift: 0 (No augmentation for testing)
                         # 4. Label Bits: The file's native label
                         for seg in segments:
@@ -912,11 +942,12 @@ class SyntheticSignalDataset(Dataset):
         """
         Combinatorial logic: Mixing, Shifting, Random Sampling.
         """
-        for layout in manifest.get_layouts():
+        for layout_idx, layout in enumerate(manifest.get_layouts()):
             available_labels = list(manifest.layout_buckets[layout].keys())
-            
-            # Combine 1, 2, 3, 4 files
-            for r in range(1, 5):
+            num_chairs = manifest.num_chairs_per_layout.get(layout, 4)
+
+            # Combine 1..num_chairs files
+            for r in range(1, num_chairs + 1): # TODO: determine the maximum number for combos
                 for combo_labels in combinations(available_labels, r):
                     
                     bit_vals = [int(k, 2) for k in combo_labels]
@@ -942,17 +973,16 @@ class SyntheticSignalDataset(Dataset):
                         # seg_combo is e.g. ( (FileA, 0), (FileB, 256) )
                         
                         combo_label_int = sum(bit_vals)
-                        new_label_bits = format(combo_label_int, '04b')
+                        new_label_bits = format(combo_label_int, f'0{num_chairs}b')
                         
-                        if self.aug_layout_training:
-                            for shift in range(self.n_channels):
-                                for slice_idx in range(4):
-                                    # seg_combo is already a tuple of (file, start), which fits our Recipe def
-                                    self.recipes.append((seg_combo, slice_idx, shift, new_label_bits))
-                        else:
-                            for slice_idx in range(4):
-                                self.recipes.append((seg_combo, slice_idx, 0, new_label_bits))
-
+                        for shift in range(self.n_channels):
+                            for slice_idx in range(num_chairs):
+                                if self.desk is not None and layout_idx < len(self.desk):
+                                    if len(self.desk[layout_idx]) > 0 and (slice_idx + 1) not in self.desk[layout_idx]:
+                                        continue
+                                # seg_combo is already a tuple of (file, start), which fits our Recipe def
+                                self.recipes.append((seg_combo, slice_idx, shift, new_label_bits))
+        
         
         if max_recipes and len(self.recipes) > max_recipes:
             rng = np.random.default_rng(42)
@@ -1110,11 +1140,7 @@ class SyntheticSignalDataset(Dataset):
                 k = np.random.randint(0, step)
                 
                 # Compute theta and the complex phasor
-                theta = k * (2 * np.pi / step) # Changed to 2pi/step to cover full circle if step is large enough, or use pi/30 logic if that was specific.
-                # The user requirement said: augment_phase_step: 60 # k*2pi/step, k in range(0, augment_phase_step)
-                # Wait, usually it's k * (2 * np.pi / step).
-                # Original code: k = randint(0, 60), theta = k * (pi / 30). pi/30 = 2pi/60. So it covers 0 to 2pi.
-                # So the formula is k * (2 * np.pi / step).
+                theta = k * (2 * np.pi / step)
                 
                 phasor = np.exp(1j * theta)
                 
@@ -1138,8 +1164,31 @@ class SyntheticSignalDataset(Dataset):
         if shift > 0:
             synthesized_signal = np.roll(synthesized_signal, shift, axis=0)
 
-        # average across the selected bins (last axis) # TODO: determine if mean pooling or max pooling
-        synthesized_signal = np.mean(synthesized_signal, axis=-1)  # Now [C, T]
+        # average across the selected bins (last axis)
+        center_idx = synthesized_signal.shape[-1] // 2
+        half_width = self.range_gating_width // 2
+        
+        # Apply random shift per channel if augment is enabled
+        if self.augment_range_gating_offset:
+            # Generate random offsets in [-1, 0, 1] for each channel
+            offsets = np.random.randint(-1, 2, size=synthesized_signal.shape[0])
+        else:
+            offsets = np.zeros(synthesized_signal.shape[0], dtype=int)
+            
+        # Extract the range-gated signal per channel since the offset might be different
+        gated_channels = []
+        for c in range(synthesized_signal.shape[0]):
+            c_idx = center_idx + offsets[c]
+            # Ensure boundaries are respected
+            start = max(0, c_idx - half_width)
+            end = min(synthesized_signal.shape[-1], c_idx + half_width + 1)
+            gated_channels.append(synthesized_signal[c, :, start:end])
+            
+        # Due to boundary clamping, different channels might have different bin lengths.
+        # We need to compute the mean across the bin dimension for each channel separately.
+        # Then we stack them back to [C, T].
+        means = [np.mean(ch, axis=-1) for ch in gated_channels]
+        synthesized_signal = np.stack(means, axis=0)  # Now [C, T]
 
         # Optional: Normalization
         if self.min_max_normalization:
@@ -1165,3 +1214,16 @@ class SyntheticSignalDataset(Dataset):
         
             
         return tensor_sig, torch.tensor(target_label, dtype=torch.float32), idx
+    
+if __name__ == '__main__':
+    print("--- Running Data Integrity Validation ---")
+    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment5"], lpf_cutoff=2.0)
+    ds = SyntheticSignalDataset(manifest, n_channels=4, 
+                                synthesis_mode=False, aug_layout_testing=False,
+                                augment_phase=False, augment_time_warp=False,
+                                window_size=1024, stride=256, max_recipes=20000, desk=[[4]])
+    print(len(ds))
+    for i in range(len(ds)):
+        sig, lab, idx = ds[i]
+        ingredients, slice_idx, shift, label_bits = ds.recipes[i]
+        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}") 

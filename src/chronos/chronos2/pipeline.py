@@ -510,7 +510,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         # extract 'root' from dataset_kwargs if it exists, else use the hardcoded path.
         dataset_root = dataset_kwargs.pop('root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir')
 
-        train_manifest = DataManifest(dataset_root, layouts=train_inputs)
+        train_manifest = DataManifest(dataset_root, layouts=train_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
         # Using dataset_params (DictConfig) directly
         train_dataset = SyntheticSignalDataset(
             train_manifest,
@@ -529,6 +529,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             window_size=context_length,
             stride=dataset_kwargs.get("stride", 256),
             convert_complex_to_float=dataset_kwargs.get("convert_complex_to_float", "I_Q"),
+            range_gating_width=dataset_kwargs.get("range_gating_width", 5),
+            augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
+            desk=dataset_kwargs.get("training_desks"),
         )
 
         sampler = None
@@ -610,7 +613,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         callbacks = callbacks or []
         if validation_inputs is not None:
             # Test: Synthesis Mode DISABLED
-            test_manifest = DataManifest(dataset_root, layouts=validation_inputs)
+            test_manifest = DataManifest(dataset_root, layouts=validation_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
             eval_dataset = SyntheticSignalDataset(
                 test_manifest, 
                 n_channels=4, 
@@ -619,6 +622,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 min_max_normalization=False,
                 window_size=context_length,
                 stride=256,
+                range_gating_width=dataset_kwargs.get("range_gating_width", 5),
+                augment_range_gating_offset=dataset_kwargs.get("test_augment_range_gating_offset", False),
+                desk=dataset_kwargs.get("testing_desks"),
             )
 
             # set validation parameters
@@ -626,12 +632,12 @@ class Chronos2Pipeline(BaseChronosPipeline):
             # training_kwargs["save_steps"] = 100
             training_kwargs["eval_strategy"] = "steps"
             training_kwargs["eval_steps"] = 100
-            # training_kwargs["load_best_model_at_end"] = True
+            training_kwargs["load_best_model_at_end"] = False  # disable final step model saving
             training_kwargs["metric_for_best_model"] = "eval_loss"
             training_kwargs["label_names"] = ["labels"]
 
             # add callback to ensure that the final model is evaluated
-            callbacks.append(EvaluateAndSaveFinalStepCallback())
+            # callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
 
         training_kwargs.update(extra_trainer_kwargs)
 
