@@ -699,6 +699,55 @@ class ChronosClassificationCollate:
             "labels": labels           # [B]
         }
 
+class ChronosSupConCollate:
+    def __init__(self, context_length: int):
+        self.context_length = context_length
+
+    def __call__(self, batch):
+        # batch is a list of (view1, view2, label, idx) from SyntheticSignalDataset (supcon=True)
+        # view shape: [N_channels, T_steps]
+        
+        view1_signals = [item[0] for item in batch]
+        view2_signals = [item[1] for item in batch]
+        
+        # We assume labels are identically assigned for the instance pair
+        labels = torch.tensor([item[2] for item in batch])
+        
+        # 1. Handle Padding/Truncating to context_length
+        processed_v1 = []
+        processed_v2 = []
+        for v1, v2 in zip(view1_signals, view2_signals):
+            if v1.shape[-1] > self.context_length:
+                v1 = v1[:, -self.context_length:]
+            if v2.shape[-1] > self.context_length:
+                v2 = v2[:, -self.context_length:]
+            processed_v1.append(v1)
+            processed_v2.append(v2)
+            
+        # 2. Stack into [B, N, T]
+        context_v1 = torch.stack(processed_v1)
+        context_v2 = torch.stack(processed_v2)
+        
+        B, N, T = context_v1.shape
+        
+        # Combine batches: first B are view1, next B are view2
+        # Shape becomes [2B, N, T]
+        context = torch.cat([context_v1, context_v2], dim=0)
+        
+        # Flatten into Chronos-2 Variates form -> [2B*N, T]
+        context = context.view(2 * B * N, T) 
+
+        # 3. Create Group IDs
+        # Each view instance must be distinctly grouped
+        # view1 items get 0 to B-1; view2 items get B to 2B-1
+        group_ids = torch.arange(2 * B).repeat_interleave(N)
+
+        return {
+            "context": context,        # [2B*N, T]
+            "group_ids": group_ids,    # [2B*N]
+            "labels": labels           # [B]
+        }
+
 # A Recipe Structure:
 # (List of (file_path, start_time_idx), slice_idx, channel_shift, label_bits)
 Recipe = Tuple[List[Tuple[str, int]], int, int, str]
@@ -711,6 +760,7 @@ class DataManifest:
         # Structure: layout_name -> { label_str -> [file_paths] }
         self.layout_buckets: Dict[str, Dict[str, List[str]]] = {}
         self.shape_cache: Dict[str, Tuple[int, ...]] = {} 
+        self.input_layouts = layouts
         search_path = os.path.join(root_dir, "*", "*.npy")
         all_files = glob.glob(search_path)
         
@@ -785,6 +835,8 @@ class DataManifest:
         return '0' * num_chairs
 
     def get_layouts(self) -> List[str]:
+        if self.input_layouts is not None:
+            return [layout for layout in self.input_layouts if layout in self.layout_buckets]
         return list(self.layout_buckets.keys())
 
     def get_files(self, layout: str, label: str) -> List[str]:
@@ -816,7 +868,8 @@ class SyntheticSignalDataset(Dataset):
                  convert_complex_to_float: str = "I_Q",
                  range_gating_width: int = 5,
                  augment_range_gating_offset: bool = False,
-                 desk: Optional[List[List[int]]] = None):
+                 desk: Optional[List[List[int]]] = None,
+                 supcon_mode: bool = False):
         """
         Args:
             manifest: Populated DataManifest.
@@ -870,11 +923,13 @@ class SyntheticSignalDataset(Dataset):
         self.blending_alpha_range = blending_alpha_range
         self.convert_complex_to_float = convert_complex_to_float
         self.recipes: List[Recipe] = []
+        self.neg_pools = {}
         self.min_max_normalization = min_max_normalization
         self.range_gating_width = range_gating_width
         self.augment_range_gating_offset = augment_range_gating_offset
         self.manifest = manifest
         self.desk = desk
+        self.supcon_mode = supcon_mode
         
         # --- Mode Switching ---
         if synthesis_mode:
@@ -906,6 +961,7 @@ class SyntheticSignalDataset(Dataset):
         Returns whatever is in the folder.
         """
         for layout_idx, layout in enumerate(manifest.get_layouts()):
+            print("Layout is", layout, self.desk[layout_idx])
             # Get all labels/files in this layout
             labels = manifest.layout_buckets[layout].keys()
             for lbl in labels:
@@ -940,49 +996,48 @@ class SyntheticSignalDataset(Dataset):
 
     def _build_training_recipes(self, manifest: DataManifest, max_recipes: int):
         """
-        Combinatorial logic: Mixing, Shifting, Random Sampling.
+        Single-file with Alpha Blended Augmentations (Dynamic Sampling).
         """
+        import random
         for layout_idx, layout in enumerate(manifest.get_layouts()):
-            available_labels = list(manifest.layout_buckets[layout].keys())
             num_chairs = manifest.num_chairs_per_layout.get(layout, 4)
+            
+            # Pre-compute pools of negative segments per slice_idx
+            # For each slice_idx, we want all segments from files where label_bits[slice_idx] == '0'
+            neg_pools = {i: [] for i in range(num_chairs)}
+            
+            all_segments_info = []
 
-            # Combine 1..num_chairs files
-            for r in range(1, num_chairs + 1): # TODO: determine the maximum number for combos
-                for combo_labels in combinations(available_labels, r):
-                    
-                    bit_vals = [int(k, 2) for k in combo_labels]
-                    if self._has_overlap(bit_vals): continue
-                    
-                    # 1. Gather all ingredients
-                    # For each label in the combo, get ALL valid segments from ALL files
-                    # lists_of_segments will be: [ [All segments for Label A], [All segments for Label B] ]
-                    lists_of_segments = []
-                    for lbl in combo_labels:
-                        files = manifest.get_files(layout, lbl)
-                        label_segments = []
-                        for f in files:
-                            label_segments.extend(self._get_file_segments(f))
-                        lists_of_segments.append(label_segments)                    
+            for lbl in manifest.layout_buckets[layout].keys():
+                files = manifest.get_files(layout, lbl)
+                for fpath in files:
+                    segments = self._get_file_segments(fpath)
+                    for seg in segments:
+                        all_segments_info.append((seg, lbl))
+                        for i in range(num_chairs):
+                            if lbl[i] == '0':
+                                neg_pools[i].append(seg)
+            
+            self.neg_pools[layout] = neg_pools
 
-                    # 2. Combine Ingredients
-                    # We pick one segment from Label A list and one from Label B list
-                    # This allows FileA_Segment0 to mix with FileB_Segment9
-                    segment_combos = self._safe_product(lists_of_segments, limit=5000) 
-                    
-                    for seg_combo in segment_combos:
-                        # seg_combo is e.g. ( (FileA, 0), (FileB, 256) )
+            for seg, lbl in all_segments_info:
+                for slice_idx in range(num_chairs):
+                    if self.desk is not None and layout_idx < len(self.desk):
+                        if len(self.desk[layout_idx]) > 0 and (slice_idx + 1) not in self.desk[layout_idx]:
+                            continue
+                    if self.aug_layout_training:
+                        shift_range = range(self.n_channels)
+                    else:
+                        shift_range = [0]
+                    for shift in shift_range:
+                        # Base recipe: single segment
+                        self.recipes.append(([seg], slice_idx, shift, lbl, layout, False))
                         
-                        combo_label_int = sum(bit_vals)
-                        new_label_bits = format(combo_label_int, f'0{num_chairs}b')
-                        
-                        for shift in range(self.n_channels):
-                            for slice_idx in range(num_chairs):
-                                if self.desk is not None and layout_idx < len(self.desk):
-                                    if len(self.desk[layout_idx]) > 0 and (slice_idx + 1) not in self.desk[layout_idx]:
-                                        continue
-                                # seg_combo is already a tuple of (file, start), which fits our Recipe def
-                                self.recipes.append((seg_combo, slice_idx, shift, new_label_bits))
-        
+                        # Augmented recipe: flag it, keep it un-paired for now
+                        # Skip adding explicit augmented recipes if supcon_mode is True,
+                        # because SupCon generates matched augmented views pairs dynamically.
+                        if not self.supcon_mode and len(neg_pools[slice_idx]) > 0:
+                            self.recipes.append(([seg], slice_idx, shift, lbl, layout, True))
         
         if max_recipes and len(self.recipes) > max_recipes:
             rng = np.random.default_rng(42)
@@ -1000,7 +1055,9 @@ class SyntheticSignalDataset(Dataset):
         label_1_count = 0
         
         # Iterate over metadata only (fast)
-        for _, slice_idx, _, label_bits in self.recipes:
+        for unpack in self.recipes:
+            slice_idx = unpack[1]
+            label_bits = unpack[3]
             # Check the bit string at the specific slice index
             if label_bits[slice_idx] == '1':
                 label_1_count += 1
@@ -1111,40 +1168,142 @@ class SyntheticSignalDataset(Dataset):
                     
         return warped_signal
 
+    def _finalize_signal(self, synthesized_signal: np.ndarray, shift: int) -> torch.Tensor:
+        """
+        Applies final transformations: circular shift, range gating, normalization, and complex to float conversion.
+        """
+        if shift > 0:
+            synthesized_signal = np.roll(synthesized_signal, shift, axis=0)
+
+        center_idx = synthesized_signal.shape[-1] // 2
+        half_width = self.range_gating_width // 2
+        
+        if self.augment_range_gating_offset:
+            offsets = np.random.randint(-1, 2, size=synthesized_signal.shape[0])
+        else:
+            offsets = np.zeros(synthesized_signal.shape[0], dtype=int)
+            
+        gated_channels = []
+        for c in range(synthesized_signal.shape[0]):
+            c_idx = center_idx + offsets[c]
+            start = max(0, c_idx - half_width)
+            end = min(synthesized_signal.shape[-1], c_idx + half_width + 1)
+            gated_channels.append(synthesized_signal[c, :, start:end])
+            
+        means = [np.mean(ch, axis=-1) for ch in gated_channels]
+        synthesized_signal = np.stack(means, axis=0)
+
+        if self.min_max_normalization:
+            synthesized_signal = self.min_max_norm(synthesized_signal)
+
+        if self.stack_complex:
+            if self.convert_complex_to_float == "mag_phase":
+                mag = torch.from_numpy(np.abs(synthesized_signal))
+                angle = torch.from_numpy(np.angle(synthesized_signal))
+                tensor_sig = torch.stack([mag, angle], dim=1).reshape(-1, *mag.shape[1:])
+            else:
+                real = torch.from_numpy(synthesized_signal.real)
+                imag = torch.from_numpy(synthesized_signal.imag)
+                tensor_sig = torch.stack([real, imag], dim=1).reshape(-1, *real.shape[1:])
+        else:
+            tensor_sig = torch.from_numpy(synthesized_signal)
+            
+        return tensor_sig
+
     def __len__(self):
         return len(self.recipes)
 
     def __getitem__(self, idx):
         # 1. Unpack Recipe
-        # ingredients is a list of tuples: [(fileA, startA), (fileB, startB)]
-        ingredients, slice_idx, shift, label_bits = self.recipes[idx]
+        unpack = self.recipes[idx]
+        if len(unpack) == 4:
+            ingredients, slice_idx, shift, label_bits = unpack
+            layout = None
+            is_augmented = False
+        else:
+            ingredients, slice_idx, shift, label_bits, layout, is_augmented = unpack
+
+        # Copy ingredients so we don't mutate the recipe over epochs
+        ingredients = list(ingredients)
+        
+        # Label Logic
+        target_label = 1.0 if label_bits[slice_idx] == '1' else 0.0
+        label_tensor = torch.tensor(target_label, dtype=torch.float32)
+
+        if self.supcon_mode:
+            import random
+            
+            # Base logic handles a single positive segment inside `ingredients[0]`
+            (fpath, start_idx) = ingredients[0]
+            raw = np.load(fpath, mmap_mode='r')
+            end_idx = start_idx + self.window_size
+            base_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
+            
+            # 1. Time Warp once for the base segment
+            if self.augment_time_warp:
+                base_slice = self._apply_time_warp(base_slice, strength=self.time_warp_strength)
+            
+            def augment_view(base_sig):
+                view_sig = base_sig.copy()
+                
+                # Apply Random Phase
+                if self.augment_phase: 
+                    step = self.augment_phase_step
+                    k = np.random.randint(0, step)
+                    theta = k * (2 * np.pi / step)
+                    phasor = np.exp(1j * theta)
+                    view_sig = (view_sig * phasor).astype(np.complex64)
+                    
+                # Pair with randomly sampled negative segment unconditionally if available behind pool
+                if layout is not None and len(self.neg_pools[layout][slice_idx]) > 0:
+                    (neg_fpath, neg_start_idx) = random.choice(self.neg_pools[layout][slice_idx])
+                    neg_raw = np.load(neg_fpath, mmap_mode='r')
+                    neg_end = neg_start_idx + self.window_size
+                    neg_slice = neg_raw[slice_idx, :, neg_start_idx:neg_end, :].copy()
+                    
+                    if self.augment_time_warp:
+                        neg_slice = self._apply_time_warp(neg_slice, strength=self.time_warp_strength)
+                        
+                    if self.augment_phase:
+                        k2 = np.random.randint(0, step)
+                        theta2 = k2 * (2 * np.pi / step)
+                        phasor2 = np.exp(1j * theta2)
+                        neg_slice = (neg_slice * phasor2).astype(np.complex64)
+                        
+                    blending_alpha = 1.0
+                    if self.blending_alpha_enabled:
+                        low, high = self.blending_alpha_range
+                        blending_alpha = np.random.uniform(low, high)
+                    view_sig += blending_alpha * neg_slice
+                
+                return self._finalize_signal(view_sig, shift)
+
+            # Generate two augmentated views via branching logic
+            view1 = augment_view(base_slice)
+            view2 = augment_view(base_slice)
+            
+            return view1, view2, label_tensor, idx
+
+        # Default Flow (Classification)
+        if is_augmented and layout is not None:
+            import random
+            pool = self.neg_pools[layout][slice_idx]
+            if len(pool) > 0:
+                ingredients.append(random.choice(pool))
         
         synthesized_signal = None
-        target_label = 0.0
         
         # 1. Load & Sum
-        # In Test Mode: 'files' is just a list of 1 file. The loop runs once.
-        # In Train Mode: 'files' is a list of N files. The loop sums them.
         for (fpath, start_idx) in ingredients:
             raw = np.load(fpath, mmap_mode='r')
-            
-            # Slice [4, C, T, S] -> [C, T, S]
             end_idx = start_idx + self.window_size
-            
-            # Slice: (4, 4, T, 3) -> Extract specific window for THIS file
             signal_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
 
             if self.augment_phase: 
-                # Select random integer k from [0, augment_phase_step-1]
                 step = self.augment_phase_step
                 k = np.random.randint(0, step)
-                
-                # Compute theta and the complex phasor
                 theta = k * (2 * np.pi / step)
-                
                 phasor = np.exp(1j * theta)
-                
-                # Apply rotation: signal * e^(j*theta)
                 signal_slice = (signal_slice * phasor).astype(np.complex64)
             
             if self.augment_time_warp:
@@ -1159,71 +1318,36 @@ class SyntheticSignalDataset(Dataset):
                     blending_alpha = np.random.uniform(low, high)
                 synthesized_signal += blending_alpha * signal_slice
         
-        # 2. Augmentation (Circular Shift)
-        # In Test Mode: shift is 0, so this block does nothing.
-        if shift > 0:
-            synthesized_signal = np.roll(synthesized_signal, shift, axis=0)
-
-        # average across the selected bins (last axis)
-        center_idx = synthesized_signal.shape[-1] // 2
-        half_width = self.range_gating_width // 2
-        
-        # Apply random shift per channel if augment is enabled
-        if self.augment_range_gating_offset:
-            # Generate random offsets in [-1, 0, 1] for each channel
-            offsets = np.random.randint(-1, 2, size=synthesized_signal.shape[0])
-        else:
-            offsets = np.zeros(synthesized_signal.shape[0], dtype=int)
+        tensor_sig = self._finalize_signal(synthesized_signal, shift)
             
-        # Extract the range-gated signal per channel since the offset might be different
-        gated_channels = []
-        for c in range(synthesized_signal.shape[0]):
-            c_idx = center_idx + offsets[c]
-            # Ensure boundaries are respected
-            start = max(0, c_idx - half_width)
-            end = min(synthesized_signal.shape[-1], c_idx + half_width + 1)
-            gated_channels.append(synthesized_signal[c, :, start:end])
-            
-        # Due to boundary clamping, different channels might have different bin lengths.
-        # We need to compute the mean across the bin dimension for each channel separately.
-        # Then we stack them back to [C, T].
-        means = [np.mean(ch, axis=-1) for ch in gated_channels]
-        synthesized_signal = np.stack(means, axis=0)  # Now [C, T]
-
-        # Optional: Normalization
-        if self.min_max_normalization:
-            synthesized_signal = self.min_max_norm(synthesized_signal)
-
-        # 3. Complex Handling & Tensor Conversion
-        if self.stack_complex:
-            if self.convert_complex_to_float == "mag_phase":
-                mag = torch.from_numpy(np.abs(synthesized_signal))
-                angle = torch.from_numpy(np.angle(synthesized_signal))
-                tensor_sig = torch.stack([mag, angle], dim=1).reshape(-1, *mag.shape[1:]) # stack mag/phase interleaved
-            else:
-                # Default "I_Q"
-                real = torch.from_numpy(synthesized_signal.real)
-                imag = torch.from_numpy(synthesized_signal.imag)
-                tensor_sig = torch.stack([real, imag], dim=1).reshape(-1, *real.shape[1:]) # stack I/Q interleaved
-        else:
-            tensor_sig = torch.from_numpy(synthesized_signal)
-            
-        # Label Logic
-        if label_bits[slice_idx] == '1':
-            target_label = 1.0
-        
-            
-        return tensor_sig, torch.tensor(target_label, dtype=torch.float32), idx
+        return tensor_sig, label_tensor, idx
     
 if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")
-    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment5"], lpf_cutoff=2.0)
+    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment7", "deployment5", "deployment4"], lpf_cutoff=2.0)
     ds = SyntheticSignalDataset(manifest, n_channels=4, 
                                 synthesis_mode=False, aug_layout_testing=False,
                                 augment_phase=False, augment_time_warp=False,
-                                window_size=1024, stride=256, max_recipes=20000, desk=[[4]])
+                                window_size=1024, stride=1000, max_recipes=20000, desk=[[1,2,4,5,6], [], []],
+                                aug_layout_training=False)
     print(len(ds))
     for i in range(len(ds)):
         sig, lab, idx = ds[i]
-        ingredients, slice_idx, shift, label_bits = ds.recipes[i]
-        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}") 
+        unpack = ds.recipes[i]
+        if len(unpack) == 4:
+            ingredients, slice_idx, shift, label_bits = unpack
+            layout = None
+            is_augmented = False
+        else:
+            ingredients, slice_idx, shift, label_bits, layout, is_augmented = unpack
+        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}") 
+
+    manifest = DataManifest(root_dir='./tdma_sensing/cir_files/processed_cir', layouts=['deployment5'], lpf_cutoff=2.0)
+    ds = SyntheticSignalDataset(manifest, n_channels=4, synthesis_mode=True, 
+                                supcon_mode=True, augment_phase=True, augment_time_warp=True)
+
+    print(f'Length: {len(ds)}')
+    view1, view2, lab, idx = ds[0]
+    print('Shape of view1:', view1.shape)
+    print('Shape of view2:', view2.shape)
+    print('Shape of lab:', lab.shape)
