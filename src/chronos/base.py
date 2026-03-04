@@ -339,11 +339,27 @@ class BaseChronosPipeline(metaclass=PipelineRegistry):
         pretrained_model_name_or_path: Union[str, Path],
         *model_args,
         force_s3_download=False,
+        skip_mismatch=False,
         **kwargs,
     ):
         """
         Load the model, either from a local path, S3 prefix, or from the HuggingFace Hub.
         Supports the same arguments as ``AutoConfig`` and ``AutoModel`` from ``transformers``.
+
+        Parameters
+        ----------
+        pretrained_model_name_or_path : Union[str, Path]
+            The model identifier or path to load from.
+        force_s3_download : bool, optional
+            Force download from S3 cache. Only relevant for S3 paths.
+        skip_mismatch : bool, optional
+            If True, allows loading partial weights when dimensions mismatch (e.g., when
+            the classification head has changed). Enables transfer learning scenarios
+            where the model architecture is slightly different from the pretrained version.
+            Default is False.
+        **kwargs
+            Additional arguments passed to ``AutoConfig.from_pretrained`` and the pipeline's
+            ``from_pretrained`` method.
         """
         if str(pretrained_model_name_or_path).startswith("s3://"):
             from .boto_utils import cache_model_from_s3
@@ -351,13 +367,19 @@ class BaseChronosPipeline(metaclass=PipelineRegistry):
             local_model_path = cache_model_from_s3(
                 str(pretrained_model_name_or_path), force_download=force_s3_download
             )
-            return cls.from_pretrained(local_model_path, *model_args, **kwargs)
+            return cls.from_pretrained(
+                local_model_path, *model_args, skip_mismatch=skip_mismatch, **kwargs
+            )
 
         from transformers import AutoConfig
 
         torch_dtype = kwargs.get("torch_dtype", "auto")
         if torch_dtype != "auto" and isinstance(torch_dtype, str):
             kwargs["torch_dtype"] = cls.dtypes[torch_dtype]
+
+        # Enable partial loading of weights when dimensions mismatch
+        if skip_mismatch:
+            kwargs.setdefault("ignore_mismatched_sizes", True)
 
         config = AutoConfig.from_pretrained(pretrained_model_name_or_path, **kwargs)
         is_valid_config = hasattr(config, "chronos_pipeline_class") or hasattr(config, "chronos_config")

@@ -114,6 +114,9 @@ class Chronos2ForecastingConfig:
     patch_stride_stats: int = 32
     train_loss: str = 'cross_entropy'
     output_all_hidden_states: bool = False
+    n_classes: int = 2
+    n_channels: int = 8
+    simclr_temperature: float = 0.2
 
     @classmethod
     def editable_fields(cls) -> list[str]:

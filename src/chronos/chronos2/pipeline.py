@@ -391,6 +391,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         n_channels: int = 8,
         eval_layout_augmentation: bool = False,
         train_weighted_sampler: bool = False,
+        gradient_accumulation_steps: int = 1,
         dataset_kwargs: dict = None,
         model_update_kwargs: dict = None,
         **extra_trainer_kwargs,
@@ -473,7 +474,11 @@ class Chronos2Pipeline(BaseChronosPipeline):
             config.chronos_config.update(model_update_kwargs)
             output_all_hidden_states = model_update_kwargs.get("output_all_hidden_states", False)
             
-        model = Chronos2ModelClassification(config, n_classes=n_classes, output_all_hidden_states=output_all_hidden_states, n_channels=n_channels).to(self.model.device)
+        config.chronos_config["n_classes"] = n_classes
+        config.chronos_config["n_channels"] = n_channels
+        config.chronos_config["output_all_hidden_states"] = output_all_hidden_states
+
+        model = Chronos2ModelClassification(config).to(self.model.device)
         model.load_state_dict(self.model.state_dict(), strict=False) # allow missing classification head
         model.supcon_mode = True
 
@@ -488,7 +493,10 @@ class Chronos2Pipeline(BaseChronosPipeline):
                         "self_attention.k",
                         "self_attention.o",
                         "output_patch_embedding.output_layer",
-                        "classification_head",
+                        "classification_head.0",
+                        "classification_head.2",
+                        "projection_head.0",
+                        "projection_head.2",
                     ]
                 )
             elif isinstance(lora_config, dict):
@@ -591,18 +599,18 @@ class Chronos2Pipeline(BaseChronosPipeline):
             warmup_ratio=warmup_ratio,
             optim="adamw_torch_fused",
             logging_strategy="steps",
-            logging_steps=10,
+            logging_steps=50,
             disable_tqdm=False,
             report_to="wandb",
             run_name='chronos2-supcon',
             max_steps=num_steps,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             dataloader_num_workers=0,
             tf32=has_sm80 and not use_cpu,
             bf16=has_sm80 and not use_cpu,
             save_only_model=True,
             prediction_loss_only=False,
-            save_total_limit=1,
+            save_total_limit=40,
             save_strategy="no",
             save_steps=None,
             eval_strategy="no",
@@ -620,9 +628,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             eval_dataset = SyntheticSignalDataset(
                 test_manifest,
                 n_channels=4, 
-                synthesis_mode=True,
+                synthesis_mode=False,
                 supcon_mode=True, 
-                aug_layout_training=True,
+                aug_layout_training=False,
                 augment_phase=dataset_kwargs.get("train_augment_phase", True),
                 augment_phase_step=dataset_kwargs.get("augment_phase_step", 60),
                 augment_time_warp=dataset_kwargs.get("train_augment_time_warp", True),
@@ -635,21 +643,21 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 stride=dataset_kwargs.get("stride", 256),
                 convert_complex_to_float=dataset_kwargs.get("convert_complex_to_float", "I_Q"),
                 range_gating_width=dataset_kwargs.get("range_gating_width", 5),
-                augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
-                desk=dataset_kwargs.get("training_desks"),
+                augment_range_gating_offset=False,
+                desk=dataset_kwargs.get("testing_desks"),
             )
 
             # set validation parameters
-            # training_kwargs["save_strategy"] = "steps"
-            # training_kwargs["save_steps"] = 100
+            training_kwargs["save_strategy"] = "steps"
+            training_kwargs["save_steps"] = 50
             training_kwargs["eval_strategy"] = "steps"
-            training_kwargs["eval_steps"] = 1000
+            training_kwargs["eval_steps"] = 50
             training_kwargs["load_best_model_at_end"] = False  # disable final step model saving
-            training_kwargs["metric_for_best_model"] = "eval_loss"
+            training_kwargs["metric_for_best_model"] = "loss" # loss / eval_loss -> eval_loss will be data leakage
             training_kwargs["label_names"] = ["labels"]
 
             # add callback to ensure that the final model is evaluated
-            # callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
+            callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
 
         training_kwargs.update(extra_trainer_kwargs)
 
@@ -668,6 +676,66 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         # Capture num_classes from the outer scope
         params_num_classes = n_classes
+
+        def compute_metrics(eval_pred): # TODO: problematic
+            predictions, labels = eval_pred
+            if isinstance(predictions, tuple):
+                # Chronos2ClassificationOutput returns (logits, embeddings)
+                if len(predictions) > 1:
+                    embeddings = predictions[1]
+                else:
+                    embeddings = predictions[0]
+            else:
+                embeddings = predictions
+                
+            import matplotlib.pyplot as plt
+            from sklearn.manifold import TSNE
+            import seaborn as sns
+            import time
+            import numpy as np
+            from pathlib import Path
+            
+            if len(embeddings) > 2000:
+                np.random.seed(42)
+                indices = np.random.choice(len(embeddings), 2000, replace=False)
+                embeddings_sample = embeddings[indices]
+                labels_sample = labels[indices]
+            else:
+                embeddings_sample = embeddings
+                labels_sample = labels
+                
+            try:
+                print(f"Running t-SNE on {len(embeddings_sample)} samples...")
+                tsne = TSNE(n_components=2, random_state=42)
+                tsne_results = tsne.fit_transform(embeddings_sample)
+
+                plt.figure(figsize=(10, 8))
+                sns.scatterplot(
+                    x=tsne_results[:, 0], 
+                    y=tsne_results[:, 1],
+                    hue=labels_sample,
+                    palette=sns.color_palette("hsv", len(np.unique(labels_sample))),
+                    legend="full",
+                    alpha=0.7
+                )
+                plt.title("t-SNE Visualization of Model Embeddings")
+                plt.xlabel("t-SNE Dimension 1")
+                plt.ylabel("t-SNE Dimension 2")
+                
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                save_path = Path(output_dir) / f"tsne_plot_{timestamp}.png"
+                plt.savefig(save_path, dpi=300, bbox_inches='tight')
+                plt.close()
+                print(f"t-SNE plot saved to {save_path}")
+                
+                if "wandb" in training_args.report_to:
+                    import wandb
+                    wandb.log({"tsne_plot": wandb.Image(str(save_path))})
+            except Exception as e:
+                print(f"Warning: Failed to create t-SNE visualization: {e}")
+                
+            # Log placeholder metrics to avoid HF Trainer complaining about empty metric dict
+            return {"tsne_generated": 1.0}
 
         # fit entry point to trainer
         collate_fn = ChronosSupConCollate(context_length=context_length)
@@ -699,7 +767,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             eval_dataset=eval_dataset,
             callbacks=callbacks,
             data_collator=collate_fn,
-            compute_metrics=None,  # No explicit metrics for SupCon
+            compute_metrics=None,
         )
 
         if remove_printer_callback:
@@ -728,8 +796,6 @@ class Chronos2Pipeline(BaseChronosPipeline):
         return finetuned_pipeline
 
 
-
-
     def fit_classifier(
         self,
         train_inputs: List[str],
@@ -753,6 +819,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
         train_weighted_sampler: bool = False,
         dataset_kwargs: dict = None,
         model_update_kwargs: dict = None,
+        linear_probe: bool = False,
+        gradient_accumulation_steps: int = 1,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         """
@@ -792,6 +860,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             If True, ensures that DataParallel is disabled and training happens on a single GPU
         eval_layout_augmentation
             If True, evaluating with 4x samples (augmented with layout shifts) and averaging the logits.
+        linear_probe
+            If True, performs linear probing by freezing the backbone network and only training the classification head.
+            When enabled, all parameters except those in the classification_head are frozen, by default False
         **extra_trainer_kwargs
             Extra kwargs are directly forwarded to `TrainingArguments`
 
@@ -833,7 +904,11 @@ class Chronos2Pipeline(BaseChronosPipeline):
             config.chronos_config.update(model_update_kwargs)
             output_all_hidden_states = model_update_kwargs.get("output_all_hidden_states", False)
             
-        model = Chronos2ModelClassification(config, n_classes=n_classes, output_all_hidden_states=output_all_hidden_states, n_channels=n_channels).to(self.model.device)
+        config.chronos_config["n_classes"] = n_classes
+        config.chronos_config["n_channels"] = n_channels
+        config.chronos_config["output_all_hidden_states"] = output_all_hidden_states
+
+        model = Chronos2ModelClassification(config).to(self.model.device)
         model.load_state_dict(self.model.state_dict(), strict=False) # allow missing classification head
 
         if finetune_mode == "lora":
@@ -847,7 +922,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
                         "self_attention.k",
                         "self_attention.o",
                         "output_patch_embedding.output_layer",
-                        "classification_head",
+                        "classification_head.0",
+                        "classification_head.2",
                     ]
                 )
             elif isinstance(lora_config, dict):
@@ -861,6 +937,19 @@ class Chronos2Pipeline(BaseChronosPipeline):
             n_trainable_params, n_params = model.get_nb_trainable_parameters()
             logger.info(
                 f"Using LoRA. Number of trainable parameters: {n_trainable_params}, total parameters: {n_params}."
+            )
+
+        if linear_probe:
+            # Freeze all parameters except classification_head
+            for name, param in model.named_parameters():
+                if "classification_head" not in name:
+                    param.requires_grad = False
+            
+            # Count trainable parameters
+            n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            n_params = sum(p.numel() for p in model.parameters())
+            logger.info(
+                f"Linear probing mode enabled. Number of trainable parameters: {n_trainable_params}, total parameters: {n_params}."
             )
 
         if context_length is None:
@@ -954,7 +1043,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             report_to="wandb",
             run_name='chronos2-lo_5',
             max_steps=num_steps,
-            gradient_accumulation_steps=1,
+            gradient_accumulation_steps=gradient_accumulation_steps,
             dataloader_num_workers=0,
             tf32=has_sm80 and not use_cpu,
             bf16=has_sm80 and not use_cpu,
@@ -982,7 +1071,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 aug_layout_testing=eval_layout_augmentation,
                 min_max_normalization=False,
                 window_size=context_length,
-                stride=256,
+                stride=dataset_kwargs.get("stride", 256),
                 range_gating_width=dataset_kwargs.get("range_gating_width", 5),
                 augment_range_gating_offset=dataset_kwargs.get("test_augment_range_gating_offset", False),
                 desk=dataset_kwargs.get("testing_desks"),
@@ -992,7 +1081,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             # training_kwargs["save_strategy"] = "steps"
             # training_kwargs["save_steps"] = 100
             training_kwargs["eval_strategy"] = "steps"
-            training_kwargs["eval_steps"] = 100
+            training_kwargs["eval_steps"] = 50
             training_kwargs["load_best_model_at_end"] = False  # disable final step model saving
             training_kwargs["metric_for_best_model"] = "eval_loss"
             training_kwargs["label_names"] = ["labels"]
@@ -1020,6 +1109,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
+            if isinstance(logits, tuple): # TODO: investigate what's wrong with the indices
+                logits = logits[0]
             
             # --- Aggregation Logic if enabled ---
             if eval_layout_augmentation:

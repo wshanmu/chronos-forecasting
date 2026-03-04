@@ -204,6 +204,7 @@ class Chronos2Output(ModelOutput):
 class Chronos2ClassificationOutput(ModelOutput):
     loss: torch.Tensor | None = None
     logits: torch.Tensor | None = None
+    embeddings: torch.Tensor | None = None
 
 
 class Chronos2Model(PreTrainedModel):
@@ -794,25 +795,25 @@ class Chronos2Model(PreTrainedModel):
         )
 
 class Chronos2ModelClassification(Chronos2Model):
-    def __init__(self, config, n_classes: int, output_all_hidden_states: bool, n_channels: int = 8):
+    def __init__(self, config, **kwargs):
         super().__init__(config)
-        self.num_classes = n_classes
-        self.output_all_hidden_states = output_all_hidden_states
-        self.n_channels = n_channels
+        self.num_classes = config.chronos_config["n_classes"]
+        self.output_all_hidden_states = config.chronos_config["output_all_hidden_states"]
+        self.n_channels = config.chronos_config["n_channels"]
         
         # Remove the forecasting head to save memory/VRAM
         del self.output_patch_embedding
         self.context_length = config.chronos_config["context_length"]
-        if output_all_hidden_states:
+        if self.output_all_hidden_states:
             self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
         else:
             self.final_dim = (self.model_dim + 2 + self.context_length//32 * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
         self.classification_head = nn.Sequential(
-            nn.Linear(self.final_dim, 512),
+            nn.Linear(self.final_dim, 64),
             nn.ReLU(),
-            nn.Linear(512, 64),
-            nn.ReLU(),
-            nn.Linear(64, n_classes),
+            # nn.Linear(512, 64),
+            # nn.ReLU(),
+            nn.Linear(64, self.num_classes),
         )
 
         self.supcon_mode = False
@@ -1004,7 +1005,13 @@ class Chronos2ModelClassification(Chronos2Model):
         # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, 2, 4, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
         # combined_features_with_statistics = (torch.mean(combined_features_with_statistics, dim=1)).view(batch_size//8, -1)
         
-        combined_features_with_statistics = combined_features_with_statistics.view(batch_size // self.n_channels, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
+        # Determine the number of variables (channels) per sample in the batch dynamically
+        # context shape is [BS * num_vars, context_length]
+        # We need to reshape back to [BS, num_vars * features]
+        # Since group_ids is [BS * num_vars], its unique values should give us BS.
+        actual_bs = len(torch.unique(group_ids)) if group_ids is not None else batch_size // self.n_channels
+        combined_features_with_statistics = combined_features_with_statistics.view(actual_bs, -1)
+        # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // self.n_channels, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
         
         if getattr(self, "supcon_mode", False):
             # 3. Projection Head
@@ -1020,13 +1027,17 @@ class Chronos2ModelClassification(Chronos2Model):
             
             loss = None
             if labels is not None:
-                supcon_loss_fct = SupConLoss(temperature=0.07)
-                loss = supcon_loss_fct(features, labels)
-            
+                simclr_temperature = self.chronos_config.__dict__.get("simclr_temperature", 0.2)
+                # supcon_loss_fct = SupConLoss(temperature=simclr_temperature)
+                # loss = supcon_loss_fct(features, labels)
+                # Experimenting with SimCLR style (unsupervised)
+                simclr_loss_fct = SimCLRLoss(temperature=simclr_temperature)
+                loss = simclr_loss_fct(features)
             # Generic return satisfying HF Trainer
             return Chronos2ClassificationOutput(
                 loss=loss,
                 logits=z1,
+                embeddings=combined_features_with_statistics,
             )
             
         # 3. Classification Head
@@ -1047,6 +1058,7 @@ class Chronos2ModelClassification(Chronos2Model):
         return Chronos2ClassificationOutput(
             loss=loss,
             logits=logits,
+            embeddings=combined_features_with_statistics,
         )
         
 import torch.nn.functional as F
@@ -1147,5 +1159,50 @@ class SupConLoss(nn.Module):
         # loss
         loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         loss = loss.view(anchor_count, batch_size).mean()
+
+        return loss
+
+class SimCLRLoss(nn.Module):
+    def __init__(self, temperature=0.07):
+        super(SimCLRLoss, self).__init__()
+        self.temperature = temperature
+
+    def forward(self, features):
+        """
+        Args:
+            features: hidden vector of shape [batch_size, n_views, dim].
+        Returns:
+            A loss scalar.
+        """
+        device = features.device
+        batch_size = features.shape[0]
+        n_views = features.shape[1]
+        
+        # Reshape to [batch_size * n_views, dim]
+        # features are assumed to be already L2 normalized based on your snippet
+        features = torch.cat(torch.unbind(features, dim=1), dim=0) 
+
+        # Compute similarity matrix (2B x 2B)
+        logits = torch.matmul(features, features.T) / self.temperature
+        
+        # For numerical stability: subtract the max logit in each row
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
+
+        # Create mask to exclude self-contrast (diagonal)
+        # We need to find the "positive" for each anchor.
+        # If views are [v1_1, v1_2, ... v1_B, v2_1, v2_2, ... v2_B]
+        # The positive for v1_i is v2_i (index i + B)
+        # The positive for v2_i is v1_i (index i - B)
+        mask = torch.eye(batch_size * n_views, dtype=torch.bool).to(device)
+        logits = logits.masked_fill(mask, -1e9) # Effectively zero out the diagonal in Exp
+
+        # Targets: The index of the corresponding view
+        # Example for 2 views: [B, B+1, ..., 2B-1, 0, 1, ..., B-1]
+        targets = torch.arange(batch_size * n_views).to(device)
+        targets = (targets + batch_size) % (batch_size * n_views)
+
+        # Cross Entropy Loss
+        loss = F.cross_entropy(logits, targets)
 
         return loss
