@@ -982,6 +982,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             range_gating_width=dataset_kwargs.get("range_gating_width", 5),
             augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
             desk=dataset_kwargs.get("training_desks"),
+            random_starting_index=True,
+            mirroring_room=True, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
         )
 
         sampler = None
@@ -1038,7 +1040,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             warmup_ratio=warmup_ratio,
             optim="adamw_torch_fused",
             logging_strategy="steps",
-            logging_steps=100,
+            logging_steps=25,
             disable_tqdm=False,
             report_to="wandb",
             run_name='chronos2-lo_5',
@@ -1081,7 +1083,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             # training_kwargs["save_strategy"] = "steps"
             # training_kwargs["save_steps"] = 100
             training_kwargs["eval_strategy"] = "steps"
-            training_kwargs["eval_steps"] = 50
+            training_kwargs["eval_steps"] = 25
             training_kwargs["load_best_model_at_end"] = False  # disable final step model saving
             training_kwargs["metric_for_best_model"] = "eval_loss"
             training_kwargs["label_names"] = ["labels"]
@@ -1109,7 +1111,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         def compute_metrics(eval_pred):
             logits, labels = eval_pred
-            if isinstance(logits, tuple): # TODO: investigate what's wrong with the indices
+            if isinstance(logits, tuple):
                 logits = logits[0]
             
             # --- Aggregation Logic if enabled ---
@@ -1126,6 +1128,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 # Average logits
                 logits_for_pred = np.mean(logits_grouped, axis=1) # [N_real, C]
                 labels_for_pred = labels_grouped[:, 0]            # [N_real]
+                assert np.all(labels_grouped == labels_for_pred[:, None]), "Labels within each group of 4 must be the same"
             else:
                 logits_for_pred = logits
                 labels_for_pred = labels

@@ -664,8 +664,39 @@ class Chronos2Dataset(IterableDataset):
 
 
 class ChronosClassificationCollate:
-    def __init__(self, context_length: int):
+    def __init__(self, context_length: int, deployment_dict: Optional[Dict] = None):
         self.context_length = context_length
+        self.deployment_dict = deployment_dict or {}
+        self.deployment_dict = {
+            "deployment4": {
+                '1': [13, 35, 28, 17],
+                '2': [13, 21, 27, 32],
+                '3': [24, 33, 15, 17],
+                '4': [25, 20, 15, 32]
+            },
+            "deployment5": {
+                '1': [26, 33, 15, 20],
+                '2': [14, 34, 27, 19],
+                '3': [25, 19, 15, 32],
+                '4': [12, 20, 28, 32]
+            },
+            "deployment7": {
+                '1': [20, 26, 43, 12], # 
+                '2': [19, 13, 43, 23], #
+                '3': [33, 24, 28, 12], # 
+                '4': [32, 12, 29, 23], #
+                '5': [48, 25, 16, 14], # 
+                '6': [48, 13, 15, 24], #
+            },
+            "deployment8": {
+                '1': [14, 31, 45, 20], 
+                '2': [14, 21, 45, 30], #
+                '3': [25, 29, 29, 17], #
+                '4': [24, 18, 29, 27], # 
+                '5': [40, 29, 16, 19], # 
+                '6': [40, 19, 16, 29], # 
+            },
+        }
 
     def __call__(self, batch):
         # batch is a list of (signal, label, idx) from SyntheticSignalDataset
@@ -673,7 +704,8 @@ class ChronosClassificationCollate:
         
         signals = [item[0] for item in batch]
         labels = torch.tensor([item[1] for item in batch])
-        
+        metas = [item[-1] for item in batch] # B
+
         # 1. Handle Padding/Truncating to context_length
         # Chronos expects [Batch, Variates, Time] or similar
         processed_signals = []
@@ -693,10 +725,45 @@ class ChronosClassificationCollate:
         # All channels (N) from the same sample (B) share a Group ID
         group_ids = torch.arange(B).repeat_interleave(N)
 
+        batch_bin_centers = []
+        for meta in metas:
+            layout = meta.get('layout')
+            slice_idx = meta.get('slice') + 1
+            shift = meta.get('shift')
+            # Fix metadata key for offset based on _finalize_signal which outputs 'offsets'
+            offsets = meta.get('offsets', np.zeros(4, dtype=int))
+            is_mirrored = meta.get('is_mirrored', False)
+            
+            # Default to [0, 0, 0, 0] if deployment_dict or layout/slice not found
+            if layout in self.deployment_dict and slice_idx <= len(self.deployment_dict[layout]):
+                base_centers = np.array(self.deployment_dict[layout][str(slice_idx)])
+            else:
+                print('No bin centers found!')
+                base_centers = np.zeros(4, dtype=int)
+                
+            if is_mirrored and len(base_centers) > 3:
+                base_centers[[1, 3]] = base_centers[[3, 1]]
+                
+            if shift > 0:
+                base_centers = np.roll(base_centers, shift)
+                
+            final_centers = base_centers + offsets
+            batch_bin_centers.append(final_centers)
+            
+        # Convert to tensor and flatten to match Group IDs
+        if batch_bin_centers: # list len: B, element: (4,)
+            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers)) # [B, 4] - need to duplicate twice (I/Q)
+            bin_centers_tensor = bin_centers_tensor.view(-1) # [B*N], N is 8
+            bin_centers_tensor = bin_centers_tensor.repeat_interleave(N//4)
+        else:
+            bin_centers_tensor = torch.empty(0)
+
+
         return {
             "context": context,        # [B*N, T]
             "group_ids": group_ids,    # [B*N]
-            "labels": labels           # [B]
+            "labels": labels,           # [B]
+            "bin_centers": bin_centers_tensor, # [B*N]
         }
 
 class ChronosSupConCollate:
@@ -762,7 +829,7 @@ class DataManifest:
         self.shape_cache: Dict[str, Tuple[int, ...]] = {} 
         self.input_layouts = layouts
         search_path = os.path.join(root_dir, "*", "*.npy")
-        all_files = glob.glob(search_path)
+        all_files = sorted(glob.glob(search_path))
         
         for fpath in all_files:
             layout_name = fpath.split(os.sep)[-2]
@@ -869,7 +936,9 @@ class SyntheticSignalDataset(Dataset):
                  range_gating_width: int = 5,
                  augment_range_gating_offset: bool = False,
                  desk: Optional[List[List[int]]] = None,
-                 supcon_mode: bool = False):
+                 supcon_mode: bool = False,
+                 random_starting_index: bool = False,
+                 mirroring_room: bool = False):
         """
         Args:
             manifest: Populated DataManifest.
@@ -930,6 +999,8 @@ class SyntheticSignalDataset(Dataset):
         self.manifest = manifest
         self.desk = desk
         self.supcon_mode = supcon_mode
+        self.random_starting_index = random_starting_index
+        self.mirroring_room = mirroring_room
         
         # --- Mode Switching ---
         if synthesis_mode:
@@ -949,6 +1020,9 @@ class SyntheticSignalDataset(Dataset):
         
         t_dim = shape[2] # Assumes (4, 4, T, 3)
         if t_dim < self.window_size: return []
+        
+        if self.random_starting_index:
+            return [(fpath, -1)]
         
         max_start = t_dim - self.window_size
         # Generate: [(f, 0), (f, 256), (f, 512)...]
@@ -988,9 +1062,11 @@ class SyntheticSignalDataset(Dataset):
                             if self.aug_layout_testing:
                                 # Apply shifts to simulate layout augmentation
                                 for shift in range(self.n_channels):
-                                    self.recipes.append(([seg], slice_idx, shift, lbl))
+                                    for is_mirrored in ([False, True] if self.mirroring_room else [False]):
+                                        self.recipes.append(([seg], slice_idx, shift, lbl, layout, False, is_mirrored))
                             else:
-                                self.recipes.append(([seg], slice_idx, 0, lbl))
+                                for is_mirrored in ([False, True] if self.mirroring_room else [False]):
+                                    self.recipes.append(([seg], slice_idx, 0, lbl, layout, False, is_mirrored))
     
         self._print_statistics()
 
@@ -1030,14 +1106,15 @@ class SyntheticSignalDataset(Dataset):
                     else:
                         shift_range = [0]
                     for shift in shift_range:
-                        # Base recipe: single segment
-                        self.recipes.append(([seg], slice_idx, shift, lbl, layout, False))
-                        
-                        # Augmented recipe: flag it, keep it un-paired for now
-                        # Skip adding explicit augmented recipes if supcon_mode is True,
-                        # because SupCon generates matched augmented views pairs dynamically.
-                        if not self.supcon_mode and len(neg_pools[slice_idx]) > 0:
-                            self.recipes.append(([seg], slice_idx, shift, lbl, layout, True))
+                        for is_mirrored in ([False, True] if self.mirroring_room else [False]):
+                            # Base recipe: single segment
+                            self.recipes.append(([seg], slice_idx, shift, lbl, layout, False, is_mirrored))
+                            
+                            # Augmented recipe: flag it, keep it un-paired for now
+                            # Skip adding explicit augmented recipes if supcon_mode is True,
+                            # because SupCon generates matched augmented views pairs dynamically.
+                            if not self.supcon_mode and len(neg_pools[slice_idx]) > 0:
+                                self.recipes.append(([seg], slice_idx, shift, lbl, layout, True, is_mirrored))
         
         if max_recipes and len(self.recipes) > max_recipes:
             rng = np.random.default_rng(42)
@@ -1168,10 +1245,14 @@ class SyntheticSignalDataset(Dataset):
                     
         return warped_signal
 
-    def _finalize_signal(self, synthesized_signal: np.ndarray, shift: int) -> torch.Tensor:
+    def _finalize_signal(self, synthesized_signal: np.ndarray, shift: int, is_mirrored: bool) -> torch.Tensor:
         """
         Applies final transformations: circular shift, range gating, normalization, and complex to float conversion.
         """
+        if is_mirrored and synthesized_signal.shape[0] > 3:
+            synthesized_signal[[1, 3]] = synthesized_signal[[3, 1]]
+
+        # Apply room mirroring
         if shift > 0:
             synthesized_signal = np.roll(synthesized_signal, shift, axis=0)
 
@@ -1208,20 +1289,14 @@ class SyntheticSignalDataset(Dataset):
         else:
             tensor_sig = torch.from_numpy(synthesized_signal)
             
-        return tensor_sig
+        return tensor_sig, offsets
 
     def __len__(self):
         return len(self.recipes)
 
     def __getitem__(self, idx):
         # 1. Unpack Recipe
-        unpack = self.recipes[idx]
-        if len(unpack) == 4:
-            ingredients, slice_idx, shift, label_bits = unpack
-            layout = None
-            is_augmented = False
-        else:
-            ingredients, slice_idx, shift, label_bits, layout, is_augmented = unpack
+        ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = self.recipes[idx]
 
         # Copy ingredients so we don't mutate the recipe over epochs
         ingredients = list(ingredients)
@@ -1236,6 +1311,8 @@ class SyntheticSignalDataset(Dataset):
             # Base logic handles a single positive segment inside `ingredients[0]`
             (fpath, start_idx) = ingredients[0]
             raw = np.load(fpath, mmap_mode='r')
+            if start_idx == -1:
+                start_idx = np.random.randint(0, max(1, raw.shape[2] - self.window_size - 100))
             end_idx = start_idx + self.window_size
             base_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
             
@@ -1258,6 +1335,8 @@ class SyntheticSignalDataset(Dataset):
                 if layout is not None and len(self.neg_pools[layout][slice_idx]) > 0:
                     (neg_fpath, neg_start_idx) = random.choice(self.neg_pools[layout][slice_idx])
                     neg_raw = np.load(neg_fpath, mmap_mode='r')
+                    if neg_start_idx == -1:
+                        neg_start_idx = np.random.randint(0, max(1, neg_raw.shape[2] - self.window_size - 100))
                     neg_end = neg_start_idx + self.window_size
                     neg_slice = neg_raw[slice_idx, :, neg_start_idx:neg_end, :].copy()
                     
@@ -1276,13 +1355,21 @@ class SyntheticSignalDataset(Dataset):
                         blending_alpha = np.random.uniform(low, high)
                     view_sig += blending_alpha * neg_slice
                 
-                return self._finalize_signal(view_sig, shift)
+                return self._finalize_signal(view_sig, shift, is_mirrored)
 
             # Generate two augmentated views via branching logic
-            view1 = augment_view(base_slice)
-            view2 = augment_view(base_slice)
+            view1, offsets1 = augment_view(base_slice)
+            view2, offsets2 = augment_view(base_slice)
             
-            return view1, view2, label_tensor, idx
+            meta_info = {
+                "layout": layout if layout is not None else "unknown",
+                "slice": slice_idx,
+                "shift": shift,
+                "offsets1": offsets1,
+                "offsets2": offsets2,
+                "is_mirrored": is_mirrored
+            }
+            return view1, view2, label_tensor, idx, meta_info
 
         # Default Flow (Classification)
         if is_augmented and layout is not None:
@@ -1296,6 +1383,8 @@ class SyntheticSignalDataset(Dataset):
         # 1. Load & Sum
         for (fpath, start_idx) in ingredients:
             raw = np.load(fpath, mmap_mode='r')
+            if start_idx == -1:
+                start_idx = np.random.randint(0, max(1, raw.shape[2] - self.window_size - 100))
             end_idx = start_idx + self.window_size
             signal_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
 
@@ -1318,36 +1407,37 @@ class SyntheticSignalDataset(Dataset):
                     blending_alpha = np.random.uniform(low, high)
                 synthesized_signal += blending_alpha * signal_slice
         
-        tensor_sig = self._finalize_signal(synthesized_signal, shift)
+        tensor_sig, offsets = self._finalize_signal(synthesized_signal, shift, is_mirrored)
             
-        return tensor_sig, label_tensor, idx
+        meta_info = {
+            "layout": layout if layout is not None else "unknown",
+            "slice": slice_idx,
+            "shift": shift,
+            "offsets": offsets,
+            "is_mirrored": is_mirrored
+        }
+        return tensor_sig, label_tensor, idx, meta_info
     
 if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")
-    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment7", "deployment5", "deployment4"], lpf_cutoff=2.0)
+    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment7"], lpf_cutoff=2.0)
     ds = SyntheticSignalDataset(manifest, n_channels=4, 
                                 synthesis_mode=False, aug_layout_testing=False,
                                 augment_phase=False, augment_time_warp=False,
-                                window_size=1024, stride=1000, max_recipes=20000, desk=[[1,2,4,5,6], [], []],
-                                aug_layout_training=False)
+                                window_size=1024, stride=256, max_recipes=20000, desk=[[]],
+                                aug_layout_training=False, random_starting_index=True, mirroring_room=False)
     print(len(ds))
     for i in range(len(ds)):
-        sig, lab, idx = ds[i]
-        unpack = ds.recipes[i]
-        if len(unpack) == 4:
-            ingredients, slice_idx, shift, label_bits = unpack
-            layout = None
-            is_augmented = False
-        else:
-            ingredients, slice_idx, shift, label_bits, layout, is_augmented = unpack
-        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}") 
+        sig, lab, idx, meta = ds[i]
+        ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = ds.recipes[i]
+        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}, is mirrored: {is_mirrored}, Meta: {meta}") 
 
-    manifest = DataManifest(root_dir='./tdma_sensing/cir_files/processed_cir', layouts=['deployment5'], lpf_cutoff=2.0)
-    ds = SyntheticSignalDataset(manifest, n_channels=4, synthesis_mode=True, 
-                                supcon_mode=True, augment_phase=True, augment_time_warp=True)
+    # manifest = DataManifest(root_dir='./tdma_sensing/cir_files/processed_cir', layouts=['deployment5'], lpf_cutoff=2.0)
+    # ds = SyntheticSignalDataset(manifest, n_channels=4, synthesis_mode=True, 
+    #                             supcon_mode=True, augment_phase=True, augment_time_warp=True)
 
-    print(f'Length: {len(ds)}')
-    view1, view2, lab, idx = ds[0]
-    print('Shape of view1:', view1.shape)
-    print('Shape of view2:', view2.shape)
-    print('Shape of lab:', lab.shape)
+    # print(f'Length: {len(ds)}')
+    # view1, view2, lab, idx = ds[0]
+    # print('Shape of view1:', view1.shape)
+    # print('Shape of view2:', view2.shape)
+    # print('Shape of lab:', lab.shape)

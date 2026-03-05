@@ -823,16 +823,27 @@ class Chronos2ModelClassification(Chronos2Model):
             nn.Linear(512, 128)
         )
 
+        self.geometry_projector = nn.Sequential(
+            nn.Linear(20, self.model_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.model_dim // 2, self.model_dim)
+        )
+
         # Call the initialization
         self.post_init_custom()
 
     def post_init_custom(self):
-        for head in [self.classification_head, self.projection_head]:
+        for head in [self.classification_head, self.projection_head, self.geometry_projector]:
             for module in head:
                 if isinstance(module, nn.Linear):
                     nn.init.xavier_uniform_(module.weight)
                     if module.bias is not None:
                         nn.init.zeros_(module.bias)
+
+        # Critically, initialize the weights and bias of the final Linear layer to zero
+        nn.init.zeros_(self.geometry_projector[-1].weight)
+        if self.geometry_projector[-1].bias is not None:
+            nn.init.zeros_(self.geometry_projector[-1].bias)
     
     def encode(
         self,
@@ -845,6 +856,7 @@ class Chronos2ModelClassification(Chronos2Model):
         future_target: torch.Tensor | None = None,
         future_target_mask: torch.Tensor | None = None,
         output_attentions: bool = False,
+        bin_centers: torch.Tensor | None = None,
     ):
         self._validate_input(
             context=context,
@@ -865,6 +877,26 @@ class Chronos2ModelClassification(Chronos2Model):
 
         # get input embeddings of shape (batch, num_context_patches, d_model)
         input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
+
+        if bin_centers is not None:
+            import math
+            # 1. Normalization
+            norm_centers = (bin_centers.float() - 10.0) / (54.0 - 10.0)
+            norm_centers = torch.clamp(norm_centers, 0.0, 1.0)
+                
+            # 2. Spectral Expansion
+            k_exp = torch.pow(2.0, torch.arange(10, device=bin_centers.device, dtype=torch.float32))
+
+            # PerceptAlign uses pi * p * 2^k
+            angle = math.pi * norm_centers.unsqueeze(1) * k_exp.unsqueeze(0)
+            geom_features = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1) # [BS, 20]
+            
+            # 3. Geometry Projector
+            geom_embeds = self.geometry_projector(geom_features)
+            
+            # 5. Integration
+            input_embeds = input_embeds + geom_embeds.unsqueeze(1)
+
         # append [REG] special token embedding, if needed
         if self.chronos_config.use_reg_token:
             reg_input_ids = torch.full((batch_size, 1), self.config.reg_token_id, device=input_embeds.device)
@@ -899,6 +931,7 @@ class Chronos2ModelClassification(Chronos2Model):
         future_target_mask: torch.Tensor | None = None,
         output_attentions: bool = False,
         labels=None,
+        bin_centers=None,
     ) -> Chronos2Output:
         """Forward pass of the Chronos2 model.
 
@@ -981,6 +1014,7 @@ class Chronos2ModelClassification(Chronos2Model):
             future_target=future_target,
             future_target_mask=future_target_mask,
             output_attentions=output_attentions,
+            bin_centers=bin_centers,
         )
         # loc_scale is the scaling parameters (bs, 2);
         loc_scale_tensor = torch.cat(loc_scale, dim=-1)
