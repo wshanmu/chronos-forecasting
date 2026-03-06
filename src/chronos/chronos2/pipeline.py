@@ -543,6 +543,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             range_gating_width=dataset_kwargs.get("range_gating_width", 5),
             augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
             desk=dataset_kwargs.get("training_desks"),
+            random_starting_index=True,
+            mirroring_room=True, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
         )
 
         sampler = None
@@ -628,7 +630,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             eval_dataset = SyntheticSignalDataset(
                 test_manifest,
                 n_channels=4, 
-                synthesis_mode=False,
+                synthesis_mode=True,
                 supcon_mode=True, 
                 aug_layout_training=False,
                 augment_phase=dataset_kwargs.get("train_augment_phase", True),
@@ -984,6 +986,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             desk=dataset_kwargs.get("training_desks"),
             random_starting_index=True,
             mirroring_room=True, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
+            gaussian_noise=True,
         )
 
         sampler = None

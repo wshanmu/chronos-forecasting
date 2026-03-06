@@ -697,6 +697,12 @@ class ChronosClassificationCollate:
                 '6': [40, 19, 16, 29], # 
             },
         }
+        
+        self.deployment_min_max = {}
+        for layout_name, layout_dict in self.deployment_dict.items():
+            all_vals = [v for vals in layout_dict.values() for v in vals]
+            if all_vals:
+                self.deployment_min_max[layout_name] = (min(all_vals) - 5, max(all_vals) + 5)
 
     def __call__(self, batch):
         # batch is a list of (signal, label, idx) from SyntheticSignalDataset
@@ -748,15 +754,20 @@ class ChronosClassificationCollate:
                 base_centers = np.roll(base_centers, shift)
                 
             final_centers = base_centers + offsets
+            
+            # if layout in self.deployment_min_max:
+            #     deploy_min, deploy_max = self.deployment_min_max[layout]
+            #     final_centers = (final_centers - deploy_min) / (deploy_max - deploy_min)
+                    
             batch_bin_centers.append(final_centers)
             
         # Convert to tensor and flatten to match Group IDs
         if batch_bin_centers: # list len: B, element: (4,)
-            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers)) # [B, 4] - need to duplicate twice (I/Q)
+            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32) # [B, 4] - need to duplicate twice (I/Q)
             bin_centers_tensor = bin_centers_tensor.view(-1) # [B*N], N is 8
             bin_centers_tensor = bin_centers_tensor.repeat_interleave(N//4)
         else:
-            bin_centers_tensor = torch.empty(0)
+            bin_centers_tensor = torch.empty(0, dtype=torch.float32)
 
 
         return {
@@ -767,8 +778,31 @@ class ChronosClassificationCollate:
         }
 
 class ChronosSupConCollate:
-    def __init__(self, context_length: int):
+    def __init__(self, context_length: int, deployment_dict: Optional[Dict] = None):
         self.context_length = context_length
+        self.deployment_dict = deployment_dict or {}
+        self.deployment_dict = {
+            "deployment4": {
+                '1': [13, 35, 28, 17], '2': [13, 21, 27, 32], '3': [24, 33, 15, 17], '4': [25, 20, 15, 32]
+            },
+            "deployment5": {
+                '1': [26, 33, 15, 20], '2': [14, 34, 27, 19], '3': [25, 19, 15, 32], '4': [12, 20, 28, 32]
+            },
+            "deployment7": {
+                '1': [20, 26, 43, 12], '2': [19, 13, 43, 23], '3': [33, 24, 28, 12],
+                '4': [32, 12, 29, 23], '5': [48, 25, 16, 14], '6': [48, 13, 15, 24],
+            },
+            "deployment8": {
+                '1': [14, 31, 45, 20], '2': [14, 21, 45, 30], '3': [25, 29, 29, 17],
+                '4': [24, 18, 29, 27], '5': [40, 29, 16, 19], '6': [40, 19, 16, 29],
+            },
+        }
+        
+        self.deployment_min_max = {}
+        for layout_name, layout_dict in self.deployment_dict.items():
+            all_vals = [v for vals in layout_dict.values() for v in vals]
+            if all_vals:
+                self.deployment_min_max[layout_name] = (min(all_vals) - 5, max(all_vals) + 5)
 
     def __call__(self, batch):
         # batch is a list of (view1, view2, label, idx) from SyntheticSignalDataset (supcon=True)
@@ -776,6 +810,7 @@ class ChronosSupConCollate:
         
         view1_signals = [item[0] for item in batch]
         view2_signals = [item[1] for item in batch]
+        metas = [item[-1] for item in batch] 
         
         # We assume labels are identically assigned for the instance pair
         labels = torch.tensor([item[2] for item in batch])
@@ -809,10 +844,49 @@ class ChronosSupConCollate:
         # view1 items get 0 to B-1; view2 items get B to 2B-1
         group_ids = torch.arange(2 * B).repeat_interleave(N)
 
+        # 4. Process Bin Centers (Same metadata for both views)
+        batch_bin_centers = []
+        for meta in metas:
+            layout = meta.get('layout')
+            slice_idx = meta.get('slice') + 1
+            shift = meta.get('shift')
+            offsets = meta.get('offsets', np.zeros(4, dtype=int))
+            is_mirrored = meta.get('is_mirrored', False)
+            
+            if layout in self.deployment_dict and str(slice_idx) in self.deployment_dict[layout]:
+                base_centers = np.array(self.deployment_dict[layout][str(slice_idx)])
+            else:
+                base_centers = np.zeros(4, dtype=int)
+                
+            if is_mirrored and len(base_centers) > 3:
+                base_centers[[1, 3]] = base_centers[[3, 1]]
+                
+            if shift > 0:
+                base_centers = np.roll(base_centers, shift)
+                
+            final_centers = base_centers + offsets
+            
+            # if layout in self.deployment_min_max:
+            #     deploy_min, deploy_max = self.deployment_min_max[layout]
+            #     final_centers = (final_centers - deploy_min) / (deploy_max - deploy_min)
+                    
+            batch_bin_centers.append(final_centers)
+            
+        if batch_bin_centers:
+            # We duplicate the bin centers because we have 2 views (2B instances)
+            bin_centers_v1 = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32)
+            bin_centers_v2 = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32)
+            bin_centers_tensor = torch.cat([bin_centers_v1, bin_centers_v2], dim=0) # [2B, 4]
+            bin_centers_tensor = bin_centers_tensor.view(-1) # [2B*N], N is 8
+            bin_centers_tensor = bin_centers_tensor.repeat_interleave(N//4)
+        else:
+            bin_centers_tensor = torch.empty(0, dtype=torch.float32)
+
         return {
             "context": context,        # [2B*N, T]
             "group_ids": group_ids,    # [2B*N]
-            "labels": labels           # [B]
+            "labels": labels,          # [B]
+            "bin_centers": bin_centers_tensor, # [2B*N]
         }
 
 # A Recipe Structure:
@@ -938,7 +1012,8 @@ class SyntheticSignalDataset(Dataset):
                  desk: Optional[List[List[int]]] = None,
                  supcon_mode: bool = False,
                  random_starting_index: bool = False,
-                 mirroring_room: bool = False):
+                 mirroring_room: bool = False,
+                 gaussian_noise: bool = False):
         """
         Args:
             manifest: Populated DataManifest.
@@ -1001,6 +1076,7 @@ class SyntheticSignalDataset(Dataset):
         self.supcon_mode = supcon_mode
         self.random_starting_index = random_starting_index
         self.mirroring_room = mirroring_room
+        self.gaussian_noise = gaussian_noise
         
         # --- Mode Switching ---
         if synthesis_mode:
@@ -1355,6 +1431,14 @@ class SyntheticSignalDataset(Dataset):
                         blending_alpha = np.random.uniform(low, high)
                     view_sig += blending_alpha * neg_slice
                 
+                if self.gaussian_noise:
+                    sigma = 0.05
+                    if np.iscomplexobj(view_sig):
+                        noise = np.random.normal(0, sigma, view_sig.shape) + 1j * np.random.normal(0, sigma, view_sig.shape)
+                    else:
+                        noise = np.random.normal(0, sigma, view_sig.shape)
+                    view_sig = (view_sig + noise).astype(view_sig.dtype)
+                    
                 return self._finalize_signal(view_sig, shift, is_mirrored)
 
             # Generate two augmentated views via branching logic
@@ -1407,6 +1491,14 @@ class SyntheticSignalDataset(Dataset):
                     blending_alpha = np.random.uniform(low, high)
                 synthesized_signal += blending_alpha * signal_slice
         
+        if self.gaussian_noise:
+            sigma = 0.05
+            if np.iscomplexobj(synthesized_signal):
+                noise = np.random.normal(0, sigma, synthesized_signal.shape) + 1j * np.random.normal(0, sigma, synthesized_signal.shape)
+            else:
+                noise = np.random.normal(0, sigma, synthesized_signal.shape)
+            synthesized_signal = (synthesized_signal + noise).astype(synthesized_signal.dtype)
+            
         tensor_sig, offsets = self._finalize_signal(synthesized_signal, shift, is_mirrored)
             
         meta_info = {
@@ -1438,6 +1530,12 @@ class MultiDeskCollate:
                 '4': [24, 18, 29, 27], '5': [40, 29, 16, 19], '6': [40, 19, 16, 29],
             },
         }
+
+        self.deployment_min_max = {}
+        for layout_name, layout_dict in self.deployment_dict.items():
+            all_vals = [v for vals in layout_dict.values() for v in vals]
+            if all_vals:
+                self.deployment_min_max[layout_name] = (min(all_vals) - 5, max(all_vals) + 5)
 
     def __call__(self, batch):
         signals = [item[0] for item in batch]
@@ -1485,15 +1583,19 @@ class MultiDeskCollate:
                 else:
                     final_centers = base_centers
                     
+                if layout in self.deployment_min_max:
+                    deploy_min, deploy_max = self.deployment_min_max[layout]
+                    final_centers = (final_centers - deploy_min) / (deploy_max - deploy_min)
+                        
                 # Repeat the bin centers for the complex stack factor (real/imag pairs have same bin center)
                 final_centers = np.repeat(final_centers, 2)
                 batch_bin_centers.append(final_centers)
                 
         if batch_bin_centers:
-            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers)) 
+            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32) 
             bin_centers_tensor = bin_centers_tensor.view(-1)
         else:
-            bin_centers_tensor = torch.empty(0)
+            bin_centers_tensor = torch.empty(0, dtype=torch.float32)
 
         desk_padding_mask = torch.tensor(batch_desk_padding, dtype=torch.bool)
 
@@ -1734,37 +1836,37 @@ class MultiDeskDataset(Dataset):
 
 if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")
-    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment4"], lpf_cutoff=2.0)
-    # ds = SyntheticSignalDataset(manifest, n_channels=4, 
-    #                             synthesis_mode=False, aug_layout_testing=False,
-    #                             augment_phase=False, augment_time_warp=False,
-    #                             window_size=1024, stride=256, max_recipes=20000, desk=[[]],
-    #                             aug_layout_training=False, random_starting_index=True, mirroring_room=False)
-    # print(len(ds))
-    # for i in range(len(ds)):
-    #     sig, lab, idx, meta = ds[i]
-    #     ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = ds.recipes[i]
-    #     print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}, is mirrored: {is_mirrored}, Meta: {meta}") 
-
-    ds = MultiDeskDataset(manifest, n_channels=4, 
-                            synthesis_mode=False, aug_layout_testing=False,
-                            augment_phase=False, augment_time_warp=False,
-                            window_size=1024, stride=256, max_recipes=20000,
-                            aug_layout_training=False, random_starting_index=True, mirroring_room=False)
-    for i in range(min(5, len(ds))):
+    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment7"], lpf_cutoff=2.0)
+    ds = SyntheticSignalDataset(manifest, n_channels=4, 
+                                synthesis_mode=False, aug_layout_testing=False,
+                                augment_phase=False, augment_time_warp=False,
+                                window_size=1024, stride=256, max_recipes=20000, desk=[[]],
+                                aug_layout_training=False, random_starting_index=True, mirroring_room=False)
+    print(len(ds))
+    for i in range(len(ds)):
         sig, lab, idx, meta = ds[i]
-        ingredients, shift, label_bits, layout, is_mirrored = ds.recipes[i]
-        print(f"Recipe {i+1}: Files: {ingredients}, Shift: {shift}, Label Bits: {label_bits}, is mirrored: {is_mirrored}, Meta: {meta}") 
+        ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = ds.recipes[i]
+        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}, is mirrored: {is_mirrored}, Meta: {meta}") 
 
-    print("\n--- Testing MultiDeskCollate ---")
-    collate_fn = MultiDeskCollate(context_length=1024)
-    batch = [ds[i] for i in range(min(2, len(ds)))]
-    collated = collate_fn(batch)
-    for k, v in collated.items():
-        if isinstance(v, torch.Tensor):
-            print(f"  {k}: shape {v.shape}, dtype {v.dtype}")
-        else:
-            print(f"  {k}: {v}")
+    # ds = MultiDeskDataset(manifest, n_channels=4, 
+    #                         synthesis_mode=False, aug_layout_testing=False,
+    #                         augment_phase=False, augment_time_warp=False,
+    #                         window_size=1024, stride=256, max_recipes=20000,
+    #                         aug_layout_training=False, random_starting_index=True, mirroring_room=False)
+    # for i in range(min(5, len(ds))):
+    #     sig, lab, idx, meta = ds[i]
+    #     ingredients, shift, label_bits, layout, is_mirrored = ds.recipes[i]
+    #     print(f"Recipe {i+1}: Files: {ingredients}, Shift: {shift}, Label Bits: {label_bits}, is mirrored: {is_mirrored}, Meta: {meta}") 
+
+    # print("\n--- Testing MultiDeskCollate ---")
+    # collate_fn = MultiDeskCollate(context_length=1024)
+    # batch = [ds[i] for i in range(min(2, len(ds)))]
+    # collated = collate_fn(batch)
+    # for k, v in collated.items():
+    #     if isinstance(v, torch.Tensor):
+    #         print(f"  {k}: shape {v.shape}, dtype {v.dtype}")
+    #     else:
+    #         print(f"  {k}: {v}")
 
 
     # manifest = DataManifest(root_dir='./tdma_sensing/cir_files/processed_cir', layouts=['deployment5'], lpf_cutoff=2.0)
