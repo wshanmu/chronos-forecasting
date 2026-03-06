@@ -8,4 +8,4 @@ from .model import Chronos2Model, Chronos2ModelClassification
 from .pipeline import Chronos2Pipeline
 from .dataset import Chronos2Dataset
 
-__all__ = ["Chronos2CoreConfig", "Chronos2ForecastingConfig", "Chronos2Model", "Chronos2ModelClassification", "Chronos2Pipeline", "Chronos2Dataset"]
+__all__ = ["Chronos2CoreConfig", "Chronos2ForecastingConfig", "Chronos2Model", "Chronos2ModelClassification", "Chronos2ModelClassificationMultiDesk", "Chronos2Pipeline", "Chronos2Dataset"]

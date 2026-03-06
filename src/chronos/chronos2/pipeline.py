@@ -21,8 +21,8 @@ from transformers.utils.peft_utils import find_adapter_config_file
 
 import chronos.chronos2
 from chronos.base import BaseChronosPipeline, ForecastType
-from chronos.chronos2 import Chronos2Model, Chronos2ModelClassification
-from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, TensorOrArray, ChronosClassificationCollate, ChronosSupConCollate, DataManifest, SyntheticSignalDataset
+from .model import Chronos2Model, Chronos2ModelClassification, Chronos2ModelClassificationMultiDesk
+from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, TensorOrArray, ChronosClassificationCollate, ChronosSupConCollate, DataManifest, SyntheticSignalDataset, MultiDeskCollate, MultiDeskDataset
 from chronos.df_utils import convert_df_input_to_list_of_dicts_input
 from chronos.utils import interpolate_quantiles, weighted_quantile
 
@@ -1355,6 +1355,509 @@ class Chronos2Pipeline(BaseChronosPipeline):
             torch.backends.cudnn.allow_tf32 = cudnn_tf32
 
         return finetuned_pipeline
+
+    def fit_classifier_multi_desk(
+        self,
+        train_inputs: List[str],
+        validation_inputs: List[str],
+        finetune_mode: Literal["full", "lora"] = "full",
+        lora_config: "LoraConfig | dict | None" = None,
+        context_length: int | None = None,
+        learning_rate: float = 1e-6,
+        lr_scheduler_type: str = "cosine",
+        warmup_ratio: float = 0.05,
+        num_steps: int = 1000,
+        batch_size: int = 256,
+        output_dir: Path | str | None = None,
+        finetuned_ckpt_name: str = "finetuned-ckpt",
+        callbacks: list["TrainerCallback"] | None = None,
+        remove_printer_callback: bool = False,
+        disable_data_parallel: bool = True,
+        n_classes: int = 2,
+        n_channels: int = 8,
+        eval_layout_augmentation: bool = False,
+        train_weighted_sampler: bool = False,
+        dataset_kwargs: dict = None,
+        model_update_kwargs: dict = None,
+        linear_probe: bool = False,
+        gradient_accumulation_steps: int = 1,
+        **extra_trainer_kwargs,
+    ) -> "Chronos2Pipeline":
+        import torch.cuda
+        from transformers.trainer_callback import PrinterCallback
+        from transformers.training_args import TrainingArguments
+        from transformers import Trainer
+
+        if finetune_mode == "lora":
+            if is_peft_available():
+                from peft import LoraConfig, get_peft_model
+            else:
+                warnings.warn(
+                    "`peft` is required for `finetune_mode='lora'`. Please install it with `pip install peft`. Falling back to `finetune_mode='full'`."
+                )
+                finetune_mode = "full"
+                lora_config = None
+
+        from chronos.chronos2.trainer import Chronos2Trainer, EvaluateAndSaveFinalStepCallback
+
+        assert finetune_mode in ["full", "lora"], f"finetune_mode must be one of ['full', 'lora'], got {finetune_mode}"
+
+        if finetune_mode == "full" and lora_config is not None:
+            raise ValueError(
+                "lora_config should not be specified when `finetune_mode='full'`. To enable LoRA, set `finetune_mode='lora'`."
+            )
+
+        # Create a copy of the model to avoid modifying the original
+        config = deepcopy(self.model.config)
+        config.chronos_config["context_length"] = context_length # Update pretrained model's config, for correct following initialization
+        
+        output_all_hidden_states = False
+        if model_update_kwargs:
+            config.chronos_config.update(model_update_kwargs)
+            output_all_hidden_states = model_update_kwargs.get("output_all_hidden_states", False)
+            
+        config.chronos_config["n_classes"] = n_classes
+        config.chronos_config["n_channels"] = n_channels
+        config.chronos_config["output_all_hidden_states"] = output_all_hidden_states
+
+        model = Chronos2ModelClassificationMultiDesk(config).to(self.model.device)
+        model.load_state_dict(self.model.state_dict(), strict=False) # allow missing classification head
+
+        if finetune_mode == "lora":
+            if lora_config is None:
+                lora_config = LoraConfig(
+                    r=8,
+                    lora_alpha=16,
+                    target_modules=[
+                        "self_attention.q",
+                        "self_attention.v",
+                        "self_attention.k",
+                        "self_attention.o",
+                        "output_patch_embedding.output_layer",
+                        "classification_head.0",
+                        "classification_head.2",
+                    ]
+                )
+            elif isinstance(lora_config, dict):
+                lora_config = LoraConfig(**lora_config)
+            else:
+                assert isinstance(lora_config, LoraConfig), (
+                    f"lora_config must be an instance of LoraConfig or a dict, got {type(lora_config)}"
+                )
+
+            model = get_peft_model(model, lora_config)
+            n_trainable_params, n_params = model.get_nb_trainable_parameters()
+            logger.info(
+                f"Using LoRA. Number of trainable parameters: {n_trainable_params}, total parameters: {n_params}."
+            )
+
+        if linear_probe:
+            # Freeze all parameters except classification_head
+            for name, param in model.named_parameters():
+                if "classification_head" not in name:
+                    param.requires_grad = False
+            
+            # Count trainable parameters
+            n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            n_params = sum(p.numel() for p in model.parameters())
+            logger.info(
+                f"Linear probing mode enabled. Number of trainable parameters: {n_trainable_params}, total parameters: {n_params}."
+            )
+
+        if context_length is None:
+            context_length = self.model_context_length
+        print("Current context length is", context_length)
+
+        dataset_kwargs = dataset_kwargs or {}
+        # extract 'root' from dataset_kwargs if it exists, else use the hardcoded path.
+        dataset_root = dataset_kwargs.pop('root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir')
+
+        train_manifest = DataManifest(dataset_root, layouts=train_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
+        # Using dataset_params (DictConfig) directly
+        train_dataset = MultiDeskDataset(
+            train_manifest,
+            n_channels=4, 
+            synthesis_mode=True, # in the training mode 
+            aug_layout_training=dataset_kwargs.get("train_augment_layout", True),
+            max_recipes=dataset_kwargs.get("train_max_recipe", 20000), 
+            augment_phase=dataset_kwargs.get("train_augment_phase", True),
+            augment_phase_step=dataset_kwargs.get("augment_phase_step", 60),
+            augment_time_warp=dataset_kwargs.get("train_augment_time_warp", True),
+            time_warp_num_knots=dataset_kwargs.get("time_warp_num_knots", 6),
+            time_warp_strength=dataset_kwargs.get("time_warp_strength", 12.0),
+            min_max_normalization=dataset_kwargs.get("dataset_min_max_norm", False),
+            window_size=context_length,
+            stride=dataset_kwargs.get("stride", 256),
+            convert_complex_to_float=dataset_kwargs.get("convert_complex_to_float", "I_Q"),
+            range_gating_width=dataset_kwargs.get("range_gating_width", 5),
+            augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
+            random_starting_index=True,
+            mirroring_room=True, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
+        )
+
+        sampler = None
+        if train_weighted_sampler:
+            from torch.utils.data import WeightedRandomSampler
+            targets = []
+            for _, slice_idx, _, label_bits in train_dataset.recipes:
+                target = 1 if label_bits[slice_idx] == '1' else 0
+                targets.append(target)
+            
+            targets = torch.tensor(targets, dtype=torch.long)
+            
+            # B. Calculate weight for each class
+            # Weight = 1 / count
+            class_counts = torch.bincount(targets)
+            # Handle edge case if a class is missing (count=0)
+            class_weights = 1. / torch.max(class_counts.float(), torch.tensor(1.0))
+            
+            # C. Assign weight to each sample
+            sample_weights = class_weights[targets]
+            
+            # D. Create the sampler
+            sampler = WeightedRandomSampler(
+                weights=sample_weights,
+                num_samples=len(sample_weights),
+                replacement=True # allows oversampling minority class
+            )
+
+        if output_dir is None:
+            output_dir = Path("chronos-2-finetuned") / time.strftime("%Y-%m-%d_%H-%M-%S")
+        elif isinstance(output_dir, str):
+            output_dir = Path(output_dir)
+
+        assert isinstance(output_dir, Path)
+
+        use_cpu = str(self.model.device) == "cpu"
+        has_sm80 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+
+        # warn user if a cuda device is available and CPU fine-tuning is used
+        if use_cpu and torch.cuda.is_available():
+            warnings.warn(
+                "The model is being fine-tuned on the CPU, but a CUDA device is available. "
+                "We recommend using the GPU for faster fine-tuning.",
+                category=UserWarning,
+                stacklevel=2,
+            )
+
+        training_kwargs: dict = dict(
+            output_dir=str(output_dir),
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            lr_scheduler_type=lr_scheduler_type,
+            warmup_ratio=warmup_ratio,
+            optim="adamw_torch_fused",
+            logging_strategy="steps",
+            logging_steps=25,
+            disable_tqdm=False,
+            report_to="wandb",
+            run_name='chronos2-lo_5',
+            max_steps=num_steps,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            dataloader_num_workers=0,
+            tf32=has_sm80 and not use_cpu,
+            bf16=has_sm80 and not use_cpu,
+            save_only_model=True,
+            prediction_loss_only=False,
+            save_total_limit=1,
+            save_strategy="no",
+            save_steps=None,
+            eval_strategy="no",
+            eval_steps=None,
+            load_best_model_at_end=False,
+            metric_for_best_model=None,
+            use_cpu=use_cpu,
+            include_for_metrics=["context", "group_ids"],
+        )
+
+        callbacks = callbacks or []
+        if validation_inputs is not None:
+            # Test: Synthesis Mode DISABLED
+            test_manifest = DataManifest(dataset_root, layouts=validation_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
+            eval_dataset = MultiDeskDataset(
+                test_manifest, 
+                n_channels=4, 
+                synthesis_mode=False, 
+                aug_layout_testing=eval_layout_augmentation,
+                min_max_normalization=False,
+                window_size=context_length,
+                stride=dataset_kwargs.get("stride", 256),
+                range_gating_width=dataset_kwargs.get("range_gating_width", 5),
+                augment_range_gating_offset=dataset_kwargs.get("test_augment_range_gating_offset", False),
+            )
+
+            # set validation parameters
+            # training_kwargs["save_strategy"] = "steps"
+            # training_kwargs["save_steps"] = 100
+            training_kwargs["eval_strategy"] = "steps"
+            training_kwargs["eval_steps"] = 25
+            training_kwargs["load_best_model_at_end"] = False  # disable final step model saving
+            training_kwargs["metric_for_best_model"] = "eval_loss"
+            training_kwargs["label_names"] = ["labels"]
+
+            # add callback to ensure that the final model is evaluated
+            # callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
+
+        training_kwargs.update(extra_trainer_kwargs)
+
+        if training_kwargs["tf32"]:
+            # setting tf32=True changes these global properties, we copy them here so that
+            # we can restore them after fine-tuning
+            matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+            cudnn_tf32 = torch.backends.cudnn.allow_tf32
+
+        training_args = TrainingArguments(**training_kwargs)
+
+        if disable_data_parallel and not use_cpu:
+            # This is a hack to disable the default `transformers` behavior of using DataParallel
+            training_args._n_gpu = 1
+            assert training_args.n_gpu == 1  # Ensure that the hack worked
+
+        # Capture num_classes from the outer scope
+        params_num_classes = n_classes
+
+        def compute_metrics(eval_pred):
+            logits, labels = eval_pred
+            if isinstance(logits, tuple):
+                logits = logits[0] # [sample, 6, 2]
+            
+            # --- Aggregation Logic if enabled ---
+            if eval_layout_augmentation:
+                N_total = logits.shape[0]
+                assert N_total % 4 == 0, f"Expected total samples to be divisible by 4, got {N_total}"
+                
+                if logits.ndim == 3: # Multi-desk shape [N, num_desks, C]
+                    logits_grouped = logits.reshape(-1, 4, logits.shape[1], logits.shape[2])
+                    labels_grouped = labels.reshape(-1, 4, labels.shape[1])
+                    
+                    logits_for_pred = np.mean(logits_grouped, axis=1) 
+                    labels_for_pred = labels_grouped[:, 0, :]         
+                else: # Single-desk shape [N, C]
+                    logits_grouped = logits.reshape(-1, 4, logits.shape[1])
+                    labels_grouped = labels.reshape(-1, 4)
+                    
+                    logits_for_pred = np.mean(logits_grouped, axis=1) 
+                    labels_for_pred = labels_grouped[:, 0]            
+            else:
+                logits_for_pred = logits
+                labels_for_pred = labels # [samples, 6]
+            # ------------------------------------
+
+            num_desks = logits_for_pred.shape[1] if logits_for_pred.ndim == 3 else 1
+
+            # Flatten across desks if applicable
+            if logits_for_pred.ndim == 3:
+                logits_flat = logits_for_pred.reshape(-1, logits_for_pred.shape[-1])
+                labels_flat = labels_for_pred.reshape(-1)
+            else:
+                logits_flat = logits_for_pred
+                labels_flat = labels_for_pred
+
+            # Base predictions
+            predictions = np.argmax(logits_flat, axis=-1)
+            
+            # Filter valid (ignore -100)
+            valid_mask = labels_flat != -100
+            
+            # Identify Wrong Samples (only among valid entries)
+            wrong_indices = np.where((predictions != labels_flat) & valid_mask)[0]
+            
+            if len(wrong_indices) > 0:
+                log_file_path = output_dir / "error_log.txt"
+                try:
+                    with open(log_file_path, "a") as f:
+                        f.write(f"\n--- Evaluation Step (Total Errors: {len(wrong_indices)}) ---\n")
+                        
+                        for i, idx in enumerate(wrong_indices):
+                            sample_idx = idx // num_desks
+                            desk_idx = idx % num_desks
+                            
+                            # Map back to dataset index
+                            dataset_idx = sample_idx * 4 if eval_layout_augmentation else sample_idx
+                                
+                            recipe_info = "Recipe unavailable"
+                            if eval_dataset is not None and hasattr(eval_dataset, 'recipes'):
+                                try:
+                                    recipe = eval_dataset.recipes[dataset_idx]
+                                    ingredients, slice_idx, shift, label_bits = recipe
+                                    recipe_info = (f"Ingredients: {ingredients}, Slice: {slice_idx}, "
+                                                   f"Shift: {shift}, LabelBits: {label_bits}")
+                                except Exception as e:
+                                    recipe_info = f"Error retrieving recipe: {e}"
+                            
+                            # Construct message
+                            msg = (f"[Error {i+1}] Global Idx: {dataset_idx} (AggIdx: {sample_idx}, Desk: {desk_idx}) | "
+                                   f"Pred: {predictions[idx]} | Label: {labels_flat[idx]} | "
+                                   f"{recipe_info}")
+                            f.write(msg + "\n")
+                                
+                except Exception as e:
+                    print(f"Warning: Failed to write error log: {e}")
+
+            # Keep only valid elements for metrics
+            logits_valid = logits_flat[valid_mask]
+            labels_valid = labels_flat[valid_mask]
+            predictions_valid = predictions[valid_mask]
+
+            if len(labels_valid) == 0:
+                return {"accuracy": 0.0, "f1": 0.0, "auc": float('nan'), "best_accuracy": 0.0, "best_threshold": 0.0, 
+                        "tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0}
+
+            # Basic Metrics
+            acc = accuracy_score(labels_valid, predictions_valid)
+            f1 = f1_score(labels_valid, predictions_valid, average='weighted')
+            
+            # Confusion Matrix
+            if logits_valid.shape[-1] == 2:
+                tn, fp, fn, tp = confusion_matrix(labels_valid, predictions_valid).ravel()
+            else:
+                cm = confusion_matrix(labels_valid, predictions_valid)
+                tp = np.diag(cm).sum()
+                fp = (cm.sum(axis=0) - np.diag(cm)).sum()
+                fn = (cm.sum(axis=1) - np.diag(cm)).sum()
+                tn = cm.sum() - (tp + fp + fn)
+
+            # ROC AUC
+            probs = softmax(logits_valid, axis=-1)
+            best_acc = 0.0
+            best_thresh = 0.5
+            auc = float('nan')
+
+            try:
+                if params_num_classes == 2:
+                    y_prob = probs[:, 1]
+                    auc = roc_auc_score(labels_valid, y_prob)
+
+                    fpr, tpr, thresholds = roc_curve(labels_valid, y_prob)
+                    
+                    accuracies = []
+                    for thresh in thresholds:
+                        y_pred_thresh = (y_prob >= thresh).astype(int)
+                        accuracies.append(accuracy_score(labels_valid, y_pred_thresh))
+                    
+                    best_idx = np.argmax(accuracies)
+                    best_acc = accuracies[best_idx]
+                    best_thresh = thresholds[best_idx]
+                    
+                    print(f"Best Threshold: {best_thresh:.4f}, Best Accuracy: {best_acc:.4f}")
+                    
+                    # Visualization wrapper...
+                    try:
+                        plt.figure(figsize=(6, 3))
+                        idx_0 = (labels_valid == 0)
+                        idx_1 = (labels_valid == 1)
+                        
+                        ax1 = plt.gca()
+                        ax2 = ax1.twinx()
+                        
+                        sns.kdeplot(y_prob[idx_1], color='blue', fill=True, alpha=0.2, ax=ax2, label='Density (Class 1)')
+                        sns.kdeplot(y_prob[idx_0], color='orange', fill=True, alpha=0.2, ax=ax2, label='Density (Class 0)')
+                        ax2.set_ylabel('Density')
+                        
+                        ax1.scatter(y_prob[idx_1], labels_valid[idx_1], color='blue', alpha=0.5, label='Class 1')
+                        ax1.scatter(y_prob[idx_0], labels_valid[idx_0], color='orange', alpha=0.5, label='Class 0')
+                        
+                        ax1.axvline(x=best_thresh, color='red', linestyle='--', label=f'Threshold: {best_thresh:.4f}')
+                        
+                        ax1.set_xlim(0, 1)
+                        ax1.set_ylim(-0.1, 1.1)
+                        ax1.set_yticks([0, 1])
+                        ax1.set_xlabel('Predicted Probability')
+                        ax1.set_ylabel('Ground Truth Label')
+                        plt.title(f'Logits Distribution & Optimal Threshold (Acc: {best_acc:.4f})')
+                        
+                        lines, labels_l = ax1.get_legend_handles_labels()
+                        ax1.legend(lines, labels_l, loc='center right')
+                        
+                        plt.tight_layout()
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        save_path = Path(output_dir) / f"prob_dist_{timestamp}.png"
+                        plt.savefig(save_path, dpi=250)
+                        plt.close()
+                        print(f"Visualization saved to {save_path}")
+                    except Exception as e:
+                        print(f"Warning: Failed to create visualization: {e}")
+                else:
+                    auc = roc_auc_score(labels_valid, probs, multi_class='ovr')
+            except ValueError as e:
+                 print(f"Warning: Could not calculate AUC or Threshold: {e}")
+
+            if "wandb" in training_args.report_to:
+                wandb.log({"conf_mat": wandb.plot.confusion_matrix(probs=None,
+                                y_true=labels_valid, preds=predictions_valid,
+                                class_names=["Empty", "Occupied"])})
+
+            return {
+                "accuracy": acc,
+                "f1": f1,
+                "auc": auc,
+                "best_accuracy": best_acc,
+                "best_threshold": best_thresh,
+                "tp": float(tp),
+                "fp": float(fp),
+                "fn": float(fn),
+                "tn": float(tn),
+            }
+
+        # fit entry point to trainer
+        collate_fn = MultiDeskCollate(context_length=context_length)
+        
+        # Define a custom Trainer to use the WeightedRandomSampler
+        class WeightedTrainer(Trainer):
+            def get_train_dataloader(self) -> DataLoader:
+                if self.train_dataset is None:
+                    raise ValueError("Trainer: training requires a train_dataset.")
+                
+                # Use standard Dataloader with our custom sampler
+                # Note: shuffle must be False when sampler is used
+                return DataLoader(
+                    self.train_dataset,
+                    batch_size=self.args.train_batch_size,
+                    sampler=sampler, 
+                    collate_fn=self.data_collator,
+                    drop_last=self.args.dataloader_drop_last,
+                    num_workers=self.args.dataloader_num_workers,
+                    pin_memory=self.args.dataloader_pin_memory,
+                )
+
+        TrainerClass = WeightedTrainer if train_weighted_sampler else Trainer
+
+        trainer = TrainerClass(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            callbacks=callbacks,
+            data_collator=collate_fn,
+            compute_metrics=compute_metrics,
+        )
+
+        if remove_printer_callback:
+            trainer.pop_callback(PrinterCallback)
+
+        trainer.train()
+
+        # update context_length and max_output_patches, if the model was fine-tuned with larger values
+        model.chronos_config.context_length = max(model.chronos_config.context_length, context_length)
+        # update chronos_config in model's config, so it is saved correctly
+        model.config.chronos_config = model.chronos_config.__dict__
+
+        # Create a new pipeline with the fine-tuned model
+        finetuned_pipeline = Chronos2Pipeline(model=model)
+
+        # # Save fine-tuned model
+        # finetuned_path = output_dir / finetuned_ckpt_name
+        # finetuned_pipeline.save_pretrained(finetuned_path)
+        # logger.info(f"Finetuned model saved to {finetuned_path}")
+
+        if training_kwargs["tf32"]:
+            # restore tf32 settings
+            torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+            torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+        return finetuned_pipeline
+
 
     def _prepare_inputs_for_long_horizon_unrolling(
         self,

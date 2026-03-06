@@ -1094,6 +1094,309 @@ class Chronos2ModelClassification(Chronos2Model):
             logits=logits,
             embeddings=combined_features_with_statistics,
         )
+
+class Chronos2ModelClassificationMultiDesk(Chronos2Model):
+    def __init__(self, config, **kwargs):
+        super().__init__(config)
+        self.num_classes = config.chronos_config["n_classes"]
+        self.output_all_hidden_states = config.chronos_config["output_all_hidden_states"]
+        self.n_channels = config.chronos_config["n_channels"]
+        
+        # Remove the forecasting head to save memory/VRAM
+        del self.output_patch_embedding
+        self.context_length = config.chronos_config["context_length"]
+        if self.output_all_hidden_states:
+            self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
+        else:
+            self.final_dim = (self.model_dim + 2 + self.context_length//32 * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
+        self.classification_head = nn.Sequential(
+            nn.Linear(self.final_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.num_classes),
+        )
+
+        self.supcon_mode = False
+        self.multiDesk = True
+
+        # Attention layer for cross-desk interaction
+        # We project the final desk features to a fixed dimension (e.g., 256) for attention
+        self.desk_projection = nn.Sequential(
+            nn.Linear(self.final_dim, 256),
+            nn.ReLU()
+        )
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=256,
+            nhead=2,
+            dim_feedforward=512,
+            batch_first=True,
+            norm_first=True,
+            dropout=0.1
+        )
+        self.cross_desk_attention = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
+        self.desk_classification_head = nn.Sequential(
+            nn.Linear(256, 64),
+            nn.ReLU(),
+            nn.Linear(64, self.num_classes)
+        )
+
+        self.projection_head = nn.Sequential(
+            nn.Linear(self.final_dim, 512),
+            nn.ReLU(),
+            nn.Linear(512, 128)
+        )
+
+        self.geometry_projector = nn.Sequential(
+            nn.Linear(20, self.model_dim // 2),
+            nn.ReLU(),
+            nn.Linear(self.model_dim // 2, self.model_dim)
+        )
+
+        # Call the initialization
+        self.post_init_custom()
+
+    def post_init_custom(self):
+        for head in [self.classification_head, self.projection_head, self.geometry_projector, self.desk_projection, self.desk_classification_head]:
+            for module in head:
+                if isinstance(module, nn.Linear):
+                    nn.init.xavier_uniform_(module.weight)
+                    if module.bias is not None:
+                        nn.init.zeros_(module.bias)
+
+        # Critically, initialize the weights and bias of the final Linear layer to zero
+        nn.init.zeros_(self.geometry_projector[-1].weight)
+        if self.geometry_projector[-1].bias is not None:
+            nn.init.zeros_(self.geometry_projector[-1].bias)
+    
+    def encode(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        future_covariates: torch.Tensor | None = None,
+        future_covariates_mask: torch.Tensor | None = None,
+        num_output_patches: int = 1,
+        future_target: torch.Tensor | None = None,
+        future_target_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        bin_centers: torch.Tensor | None = None,
+    ):
+        self._validate_input(
+            context=context,
+            context_mask=context_mask,
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            group_ids=group_ids,
+            num_output_patches=num_output_patches,
+            future_target=future_target,
+            future_target_mask=future_target_mask,
+        )
+
+        batch_size = context.shape[0]
+        patched_context, attention_mask, loc_scale, patch_stats = self._prepare_patched_context(
+            context=context, context_mask=context_mask, return_patch_stats=True
+        )
+        num_context_patches = attention_mask.shape[-1]
+
+        # get input embeddings of shape (batch, num_context_patches, d_model)
+        input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
+
+        if bin_centers is not None:
+            import math
+            # 1. Normalization
+            norm_centers = (bin_centers.float() - 10.0) / (54.0 - 10.0)
+            norm_centers = torch.clamp(norm_centers, 0.0, 1.0)
+                
+            # 2. Spectral Expansion
+            k_exp = torch.pow(2.0, torch.arange(10, device=bin_centers.device, dtype=torch.float32))
+
+            # PerceptAlign uses pi * p * 2^k
+            angle = math.pi * norm_centers.unsqueeze(1) * k_exp.unsqueeze(0)
+            geom_features = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1) # [BS, 20]
+            
+            # 3. Geometry Projector
+            geom_embeds = self.geometry_projector(geom_features)
+            
+            # 5. Integration
+            input_embeds = input_embeds + geom_embeds.unsqueeze(1)
+
+        # append [REG] special token embedding, if needed
+        if self.chronos_config.use_reg_token:
+            reg_input_ids = torch.full((batch_size, 1), self.config.reg_token_id, device=input_embeds.device)
+            reg_embeds = self.shared(reg_input_ids)
+            input_embeds = torch.cat([input_embeds, reg_embeds], dim=-2)
+            attention_mask = torch.cat(
+                [attention_mask.to(self.dtype), torch.ones_like(reg_input_ids).to(self.dtype)], dim=-1
+            )
+
+        if group_ids is None:
+            # by default, each time series is treated independently, i.e., no mixing across the batch
+            group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
+
+        encoder_outputs: Chronos2EncoderOutput = self.encoder(
+            attention_mask=attention_mask,
+            inputs_embeds=input_embeds,
+            group_ids=group_ids,
+            output_attentions=output_attentions,
+            output_hidden_states=True,
+        )
+        return encoder_outputs, loc_scale, num_context_patches, patch_stats
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        future_covariates: torch.Tensor | None = None,
+        future_covariates_mask: torch.Tensor | None = None,
+        num_output_patches: int = 1,
+        future_target: torch.Tensor | None = None,
+        future_target_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        labels=None,
+        bin_centers=None,
+        desk_padding_mask=None,
+    ) -> Chronos2Output:
+        
+        # context: [bs*num_vars, context_length]
+        # group_ids: [bs*num_vars,] 
+        
+        batch_size = context.shape[0]
+        encoder_outputs, loc_scale, num_context_patches, patch_stats = self.encode(
+            context=context,
+            context_mask=context_mask,
+            group_ids=group_ids,
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            num_output_patches=num_output_patches,
+            future_target=future_target,
+            future_target_mask=future_target_mask,
+            output_attentions=output_attentions,
+            bin_centers=bin_centers,
+        )
+        # loc_scale is the scaling parameters (bs, 2);
+        loc_scale_tensor = torch.cat(loc_scale, dim=-1)
+        # patch_stats is the statistics for each patch, Shape: (batch_size, num_patches, 4)]
+        patch_stats = patch_stats.view(batch_size, -1)
+
+        hidden_states: torch.Tensor = encoder_outputs[0]
+        assert hidden_states.shape == (batch_size, num_context_patches + 1, self.model_dim)
+
+        all_hidden_states = encoder_outputs.all_hidden_states # 12*[B*N, num_patches, d_model]
+        pooled = [torch.mean(layer, dim=1) for layer in all_hidden_states]
+        if self.output_all_hidden_states:
+            # then concatenate num_var such vectors for multivariate classification -> based on group_ids shape (BS,)
+            # Mean pool each layer across the sequence dimension
+            combined_features = torch.cat(pooled, dim=-1) # Shape: [batch*num_vars, d_model * 12]
+        else:
+            combined_features = pooled[-1]
+
+        # Shape: [batch*num_vars*num_desks, d_model * 12 + 2]
+        combined_features_with_statistics = torch.cat([combined_features, loc_scale_tensor, patch_stats], dim=1) 
+        
+        ## If we want to mean pool over I/Q per link:
+        # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, 2, 4, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
+        # combined_features_with_statistics = (torch.mean(combined_features_with_statistics, dim=1)).view(batch_size//8, -1)
+        
+        # Determine the number of variables (channels) per sample in the batch dynamically
+        # context shape is [BS * num_vars, context_length]
+        # We need to reshape back to [BS, num_vars * features]
+        # Since group_ids is [BS * num_vars], its unique values should give us BS.
+        actual_bs = len(torch.unique(group_ids)) if group_ids is not None else batch_size // self.n_channels
+        combined_features_with_statistics = combined_features_with_statistics.view(actual_bs, -1)
+        # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // self.n_channels, -1) # 4 is num_vars TODO: make this dynamic based on group_ids
+        
+        if getattr(self, "multiDesk", False):
+            # 3. Cross-Desk Attention and Classification
+            if desk_padding_mask is not None:
+                BS, num_desks = desk_padding_mask.shape
+            else:
+                num_desks = 6 # fallback
+                BS = actual_bs // num_desks
+                desk_padding_mask = torch.zeros((BS, num_desks), dtype=torch.bool, device=combined_features_with_statistics.device)
+
+            # Reshape features to [BS, num_desks, final_dim]
+            # combined_features_with_statistics is [BS * num_desks, final_dim] (n_channels dimension has been flattened into -1)
+            desk_features = combined_features_with_statistics.view(BS, num_desks, -1)
+
+            # Embed desks for attention
+            desk_embeds = self.desk_projection(desk_features) # [BS, num_desks, embed_dim]
+
+            # PyTorch Transformer padding mask expects True for elements to IGNORE.
+            # True means padded desk.
+            # Apply cross-desk attention
+            attended_features = self.cross_desk_attention(desk_embeds, src_key_padding_mask=desk_padding_mask)
+
+            # Classify each desk
+            logits = self.desk_classification_head(attended_features) # [BS, num_desks, num_classes]
+
+            loss = None
+            if labels is not None: # [BS, num_desk]
+               # flatten
+                logits_flat = logits.reshape(-1, 2)          # [(B*K), 2]
+                labels_flat = labels.reshape(-1)             # [(B*K)]
+                mask_flat   = desk_padding_mask.reshape(-1)          # [(B*K)]  True for real desks
+
+                # select only real desks
+                logits_valid = logits_flat[~mask_flat]        # [Nvalid, 2]
+                labels_valid = labels_flat[~mask_flat].long()        # [Nvalid]
+
+                loss = F.cross_entropy(logits_valid, labels_valid)
+
+            # Generic return satisfying HF Trainer
+            return Chronos2ClassificationOutput(
+                loss=loss,
+                logits=logits, # Return [BS, num_desks, num_classes]
+                embeddings=attended_features, # return sequence of embeddings!
+            )
+
+        if getattr(self, "supcon_mode", False):
+            # 3. Projection Head
+            z = self.projection_head(combined_features_with_statistics)
+            z = F.normalize(z, dim=1)
+            
+            # Split into view1 and view2
+            B = z.shape[0] // 2
+            z1, z2 = z[:B], z[B:]
+            
+            # Combine -> [B, 2, proj_dim]
+            features = torch.stack([z1, z2], dim=1)
+            
+            loss = None
+            if labels is not None:
+                simclr_temperature = self.chronos_config.__dict__.get("simclr_temperature", 0.2)
+                # supcon_loss_fct = SupConLoss(temperature=simclr_temperature)
+                # loss = supcon_loss_fct(features, labels)
+                # Experimenting with SimCLR style (unsupervised)
+                simclr_loss_fct = SimCLRLoss(temperature=simclr_temperature)
+                loss = simclr_loss_fct(features)
+            # Generic return satisfying HF Trainer
+            return Chronos2ClassificationOutput(
+                loss=loss,
+                logits=z1,
+                embeddings=combined_features_with_statistics,
+            )
+            
+        # 3. Classification Head
+        logits = self.classification_head(combined_features_with_statistics) # [BS, num_classes]
+        
+        # 4. Loss Calculation (Required for HF Trainer)
+        loss = None
+        if labels is not None:
+            train_loss_type = self.chronos_config.__dict__.get("train_loss", "cross_entropy")
+            if train_loss_type == "cross_entropy":
+                loss_fct = nn.CrossEntropyLoss()
+            elif train_loss_type == "focal_loss":
+                loss_fct = BinaryFocalLoss(alpha=0.25, gamma=2.0)
+            else:
+                loss_fct = nn.CrossEntropyLoss()
+
+            loss = loss_fct(logits, labels.long())
+        return Chronos2ClassificationOutput(
+            loss=loss,
+            logits=logits,
+            embeddings=combined_features_with_statistics,
+        )
         
 import torch.nn.functional as F
 class BinaryFocalLoss(nn.Module):
@@ -1108,7 +1411,7 @@ class BinaryFocalLoss(nn.Module):
         # targets: ground truth (0 or 1)
         
         # Calculate standard binary cross entropy
-        bce_loss_fucntion = nn.CrossEntropyLoss()
+        bce_loss_fucntion = nn.CrossEntropyLoss(reduction='none')
         bce_loss = bce_loss_fucntion(inputs, targets)
         
         # Get the probability of the true class

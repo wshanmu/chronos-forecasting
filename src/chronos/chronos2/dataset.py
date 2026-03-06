@@ -1418,19 +1418,354 @@ class SyntheticSignalDataset(Dataset):
         }
         return tensor_sig, label_tensor, idx, meta_info
     
+class MultiDeskCollate:
+    def __init__(self, context_length: int, deployment_dict: Optional[Dict] = None):
+        self.context_length = context_length
+        self.deployment_dict = deployment_dict or {}
+        self.deployment_dict = {
+            "deployment4": {
+                '1': [13, 35, 28, 17], '2': [13, 21, 27, 32], '3': [24, 33, 15, 17], '4': [25, 20, 15, 32]
+            },
+            "deployment5": {
+                '1': [26, 33, 15, 20], '2': [14, 34, 27, 19], '3': [25, 19, 15, 32], '4': [12, 20, 28, 32]
+            },
+            "deployment7": {
+                '1': [20, 26, 43, 12], '2': [19, 13, 43, 23], '3': [33, 24, 28, 12],
+                '4': [32, 12, 29, 23], '5': [48, 25, 16, 14], '6': [48, 13, 15, 24],
+            },
+            "deployment8": {
+                '1': [14, 31, 45, 20], '2': [14, 21, 45, 30], '3': [25, 29, 29, 17],
+                '4': [24, 18, 29, 27], '5': [40, 29, 16, 19], '6': [40, 19, 16, 29],
+            },
+        }
+
+    def __call__(self, batch):
+        signals = [item[0] for item in batch]
+        labels = torch.stack([item[1] for item in batch])
+        metas = [item[-1] for item in batch] 
+
+        processed_signals = []
+        for s in signals:
+            if s.shape[-1] > self.context_length:
+                s = s[:, :, -self.context_length:]
+            processed_signals.append(s)
+            
+        context = torch.stack(processed_signals) 
+        B, D, C, T_size = context.shape
+        context = context.view(B * D * C, T_size)
+
+        group_ids = torch.arange(B * D).repeat_interleave(C)
+
+        batch_bin_centers = []
+        batch_desk_padding = []
+        for meta in metas:
+            layout = meta.get('layout', 'unknown')
+            num_desks = meta.get('num_desks', 6)
+            shift = meta.get('shift', 0)
+            offsets_all = meta.get('offsets', np.zeros((D, C//2), dtype=int)) 
+            is_mirrored = meta.get('is_mirrored', False)
+
+            desk_padding = [d >= num_desks for d in range(6)]
+            batch_desk_padding.append(desk_padding)
+
+            for d in range(6):
+                if d < num_desks and layout in self.deployment_dict and str(d+1) in self.deployment_dict[layout]:
+                    base_centers = np.array(self.deployment_dict[layout][str(d+1)])
+                else:
+                    base_centers = np.zeros(C // 2, dtype=int)
+                    
+                if is_mirrored and len(base_centers) > 3:
+                    base_centers[[1, 3]] = base_centers[[3, 1]]
+                    
+                if shift > 0:
+                    base_centers = np.roll(base_centers, shift)
+                    
+                if d < num_desks:
+                    final_centers = base_centers + offsets_all[d]
+                else:
+                    final_centers = base_centers
+                    
+                # Repeat the bin centers for the complex stack factor (real/imag pairs have same bin center)
+                final_centers = np.repeat(final_centers, 2)
+                batch_bin_centers.append(final_centers)
+                
+        if batch_bin_centers:
+            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers)) 
+            bin_centers_tensor = bin_centers_tensor.view(-1)
+        else:
+            bin_centers_tensor = torch.empty(0)
+
+        desk_padding_mask = torch.tensor(batch_desk_padding, dtype=torch.bool)
+
+        return {
+            "context": context,        
+            "group_ids": group_ids,    
+            "labels": labels,          
+            "bin_centers": bin_centers_tensor, 
+            "desk_padding_mask": desk_padding_mask,
+        }
+
+class MultiDeskDataset(Dataset):
+    """
+    MultiDeskDataset: treats all slices with the same filepath & starting index as one sample [num_desk, C, T].
+    Pads to 6 desks. Applies same augmentations (warp, phase, layout shift, mirror) to all desks and channels.
+    """
+    def __init__(self, 
+                 manifest: DataManifest, 
+                 n_channels: int = 4, 
+                 window_size: int = 512,
+                 stride: int = 256,
+                 max_recipes: int = None,
+                 stack_complex: bool = True,
+                 synthesis_mode: bool = True,
+                 aug_layout_training: bool = True,
+                 aug_layout_testing: bool = False,
+                 augment_phase: bool = False,
+                 augment_phase_step: int = 60,
+                 augment_time_warp: bool = False,
+                 time_warp_num_knots: int = 6,
+                 time_warp_strength: float = 15.0,
+                 min_max_normalization: bool = True,
+                 convert_complex_to_float: str = "I_Q",
+                 range_gating_width: int = 5,
+                 augment_range_gating_offset: bool = False,
+                 random_starting_index: bool = False,
+                 mirroring_room: bool = False):
+        self.n_channels = n_channels
+        self.window_size = window_size
+        self.stride = stride
+        self.stack_complex = stack_complex
+        self.aug_layout_testing = aug_layout_testing
+        self.aug_layout_training = aug_layout_training
+        self.synthesis_mode = synthesis_mode
+        self.augment_phase = augment_phase
+        self.augment_phase_step = augment_phase_step
+        self.augment_time_warp = augment_time_warp
+        self.time_warp_num_knots = time_warp_num_knots
+        self.time_warp_strength = time_warp_strength
+        self.convert_complex_to_float = convert_complex_to_float
+        self.recipes: List[Tuple] = []
+        self.min_max_normalization = min_max_normalization
+        self.range_gating_width = range_gating_width
+        self.augment_range_gating_offset = augment_range_gating_offset
+        self.manifest = manifest
+        self.random_starting_index = random_starting_index
+        self.mirroring_room = mirroring_room
+        self.num_desks_pad = 6
+        
+        if synthesis_mode:
+            self._build_training_recipes(manifest, max_recipes)
+        else:
+            self._build_testing_recipes(manifest)
+            
+        print(f"MultiDeskDataset initialized in mode={'TRAIN/SYNTH' if synthesis_mode else 'TEST/LINEAR'}")
+        print(f"Total Samples: {len(self.recipes)}")
+
+    def _get_file_segments(self, fpath: str) -> List[Tuple[str, int]]:
+        shape = self.manifest.get_file_shape(fpath)
+        if len(shape) < 3: return []
+        t_dim = shape[2]
+        if t_dim < self.window_size: return []
+        if self.random_starting_index:
+            return [(fpath, -1)]
+        max_start = t_dim - self.window_size
+        indices = range(0, max_start + 1, self.stride)
+        return [(fpath, idx) for idx in indices]
+
+    def _build_testing_recipes(self, manifest: DataManifest):
+        for layout in manifest.get_layouts():
+            for lbl in manifest.layout_buckets[layout].keys():
+                for fpath in manifest.get_files(layout, lbl):
+                    for seg in self._get_file_segments(fpath):
+                        shift_range = range(self.n_channels) if self.aug_layout_testing else [0]
+                        for shift in shift_range:
+                            for is_mirrored in ([False, True] if self.mirroring_room else [False]):
+                                self.recipes.append(([seg], shift, lbl, layout, is_mirrored))
+
+    def _build_training_recipes(self, manifest: DataManifest, max_recipes: int):
+        for layout in manifest.get_layouts():
+            for lbl in manifest.layout_buckets[layout].keys():
+                for fpath in manifest.get_files(layout, lbl):
+                    for seg in self._get_file_segments(fpath):
+                        shift_range = range(self.n_channels) if self.aug_layout_training else [0]
+                        for shift in shift_range:
+                            for is_mirrored in ([False, True] if self.mirroring_room else [False]):
+                                self.recipes.append(([seg], shift, lbl, layout, is_mirrored))
+        
+        if max_recipes and len(self.recipes) > max_recipes:
+            rng = np.random.default_rng(42)
+            rng.shuffle(self.recipes)
+            self.recipes = self.recipes[:max_recipes]
+
+    def min_max_norm(self, signal: np.ndarray) -> np.ndarray:
+        r = np.abs(signal)
+        r_min = np.min(r)
+        r_max = np.max(r)
+        eps = 1e-12
+        r_norm = (r - r_min) / (r_max - r_min + eps)
+        return r_norm * np.exp(1j * np.angle(signal))
+
+    def _apply_time_warp(self, signal: np.ndarray, strength: float = 15.0) -> np.ndarray:
+        # signal is [D, C, T, B]
+        orig_shape = signal.shape
+        D_C = orig_shape[0] * orig_shape[1]
+        T = orig_shape[2]
+        B = orig_shape[3]
+        
+        reshaped_signal = signal.reshape(D_C, T, B)
+        
+        num_knots = self.time_warp_num_knots
+        orig_knots = np.linspace(0, T-1, num_knots)
+        offsets = np.random.normal(0, strength, num_knots)
+        offsets[0] = 0 
+        offsets[-1] = 0
+        
+        x_grid = np.arange(T)
+        dense_offsets = np.interp(x_grid, orig_knots, offsets)
+        sample_indices = x_grid + dense_offsets
+        sample_indices = np.clip(sample_indices, 0, T-1)
+        
+        warped_signal = np.zeros_like(reshaped_signal)
+        for dc in range(D_C):
+            for b in range(B):
+                if np.iscomplexobj(reshaped_signal):
+                    real = np.interp(sample_indices, x_grid, reshaped_signal[dc, :, b].real)
+                    imag = np.interp(sample_indices, x_grid, reshaped_signal[dc, :, b].imag)
+                    warped_signal[dc, :, b] = real + 1j * imag
+                else:
+                    warped_signal[dc, :, b] = np.interp(sample_indices, x_grid, reshaped_signal[dc, :, b])
+                    
+        return warped_signal.reshape(orig_shape)
+
+    def _finalize_signal(self, synthesized_signal: np.ndarray, shift: int, is_mirrored: bool) -> Tuple[torch.Tensor, np.ndarray]:
+        # synthesized_signal: [D, C, T, B]
+        if is_mirrored and synthesized_signal.shape[1] > 3:
+            synthesized_signal[:, [1, 3]] = synthesized_signal[:, [3, 1]]
+
+        if shift > 0:
+            synthesized_signal = np.roll(synthesized_signal, shift, axis=1)
+
+        center_idx = synthesized_signal.shape[-1] // 2
+        half_width = self.range_gating_width // 2
+        
+        D, C = synthesized_signal.shape[0], synthesized_signal.shape[1]
+        
+        if self.augment_range_gating_offset:
+            offsets = np.random.randint(-1, 2, size=(D, C))
+        else:
+            offsets = np.zeros((D, C), dtype=int)
+            
+        gated_desks = []
+        for d in range(D):
+            gated_channels = []
+            for c in range(C):
+                c_idx = center_idx + offsets[d, c]
+                start = max(0, c_idx - half_width)
+                end = min(synthesized_signal.shape[-1], c_idx + half_width + 1)
+                gated_channels.append(synthesized_signal[d, c, :, start:end])
+            means = [np.mean(ch, axis=-1) for ch in gated_channels]
+            gated_desks.append(np.stack(means, axis=0)) 
+            
+        synthesized_signal = np.stack(gated_desks, axis=0) 
+
+        if self.min_max_normalization:
+            synthesized_signal = self.min_max_norm(synthesized_signal)
+
+        if self.stack_complex:
+            if self.convert_complex_to_float == "mag_phase":
+                mag = torch.from_numpy(np.abs(synthesized_signal))
+                angle = torch.from_numpy(np.angle(synthesized_signal))
+                tensor_sig = torch.stack([mag, angle], dim=2).reshape(D, -1, mag.shape[-1])
+            else:
+                real = torch.from_numpy(synthesized_signal.real)
+                imag = torch.from_numpy(synthesized_signal.imag)
+                tensor_sig = torch.stack([real, imag], dim=2).reshape(D, -1, real.shape[-1])
+        else:
+            tensor_sig = torch.from_numpy(synthesized_signal)
+            
+        C_out, T_out = tensor_sig.shape[1], tensor_sig.shape[2]
+        padded_sig = torch.zeros((self.num_desks_pad, C_out, T_out), dtype=tensor_sig.dtype)
+        padded_sig[:D] = tensor_sig
+        
+        return padded_sig, offsets
+
+    def __len__(self):
+        return len(self.recipes)
+
+    def __getitem__(self, idx):
+        ingredients, shift, label_bits, layout, is_mirrored = self.recipes[idx]
+        (fpath, start_idx) = ingredients[0]
+        
+        raw = np.load(fpath, mmap_mode='r')
+        if start_idx == -1:
+            start_idx = np.random.randint(0, max(1, raw.shape[2] - self.window_size - 100))
+        end_idx = start_idx + self.window_size
+        
+        base_slice = raw[:, :, start_idx:end_idx, :].copy()
+        D = base_slice.shape[0]
+        
+        if self.augment_phase: 
+            step = self.augment_phase_step
+            k = np.random.randint(0, step)
+            theta = k * (2 * np.pi / step)
+            phasor = np.exp(1j * theta)
+            base_slice = (base_slice * phasor).astype(np.complex64)
+        
+        if self.augment_time_warp:
+            base_slice = self._apply_time_warp(base_slice, strength=self.time_warp_strength)
+            
+        tensor_sig, offsets = self._finalize_signal(base_slice, shift, is_mirrored)
+        
+        target_labels = [1.0 if bit == '1' else 0.0 for bit in label_bits]
+        
+        # Pad with -100 for missing desks up to num_desks_pad
+        target_labels_padded = target_labels + [-100.0] * (self.num_desks_pad - len(target_labels))
+        label_tensor = torch.tensor(target_labels_padded, dtype=torch.float32)
+        
+        meta_info = {
+            "layout": "unknown" if layout is None else layout,
+            "num_desks": D, 
+            "shift": shift,
+            "offsets": offsets, 
+            "is_mirrored": is_mirrored
+        }
+            
+        return tensor_sig, label_tensor, idx, meta_info
+
 if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")
-    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment7"], lpf_cutoff=2.0)
-    ds = SyntheticSignalDataset(manifest, n_channels=4, 
-                                synthesis_mode=False, aug_layout_testing=False,
-                                augment_phase=False, augment_time_warp=False,
-                                window_size=1024, stride=256, max_recipes=20000, desk=[[]],
-                                aug_layout_training=False, random_starting_index=True, mirroring_room=False)
-    print(len(ds))
-    for i in range(len(ds)):
+    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment4"], lpf_cutoff=2.0)
+    # ds = SyntheticSignalDataset(manifest, n_channels=4, 
+    #                             synthesis_mode=False, aug_layout_testing=False,
+    #                             augment_phase=False, augment_time_warp=False,
+    #                             window_size=1024, stride=256, max_recipes=20000, desk=[[]],
+    #                             aug_layout_training=False, random_starting_index=True, mirroring_room=False)
+    # print(len(ds))
+    # for i in range(len(ds)):
+    #     sig, lab, idx, meta = ds[i]
+    #     ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = ds.recipes[i]
+    #     print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}, is mirrored: {is_mirrored}, Meta: {meta}") 
+
+    ds = MultiDeskDataset(manifest, n_channels=4, 
+                            synthesis_mode=False, aug_layout_testing=False,
+                            augment_phase=False, augment_time_warp=False,
+                            window_size=1024, stride=256, max_recipes=20000,
+                            aug_layout_training=False, random_starting_index=True, mirroring_room=False)
+    for i in range(min(5, len(ds))):
         sig, lab, idx, meta = ds[i]
-        ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = ds.recipes[i]
-        print(f"Recipe {i+1}: Files: {ingredients}, Slice: {slice_idx}, Shift: {shift}, Label Bits: {label_bits}, Label: {lab.item()}, is augmented: {is_augmented}, is mirrored: {is_mirrored}, Meta: {meta}") 
+        ingredients, shift, label_bits, layout, is_mirrored = ds.recipes[i]
+        print(f"Recipe {i+1}: Files: {ingredients}, Shift: {shift}, Label Bits: {label_bits}, is mirrored: {is_mirrored}, Meta: {meta}") 
+
+    print("\n--- Testing MultiDeskCollate ---")
+    collate_fn = MultiDeskCollate(context_length=1024)
+    batch = [ds[i] for i in range(min(2, len(ds)))]
+    collated = collate_fn(batch)
+    for k, v in collated.items():
+        if isinstance(v, torch.Tensor):
+            print(f"  {k}: shape {v.shape}, dtype {v.dtype}")
+        else:
+            print(f"  {k}: {v}")
+
 
     # manifest = DataManifest(root_dir='./tdma_sensing/cir_files/processed_cir', layouts=['deployment5'], lpf_cutoff=2.0)
     # ds = SyntheticSignalDataset(manifest, n_channels=4, synthesis_mode=True, 
