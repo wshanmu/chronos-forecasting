@@ -872,7 +872,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         -------
         A new `Chronos2Pipeline` with the fine-tuned model
         """
-
+        
         import torch.cuda
         from transformers.trainer_callback import PrinterCallback
         from transformers.training_args import TrainingArguments
@@ -984,8 +984,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             range_gating_width=dataset_kwargs.get("range_gating_width", 5),
             augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
             desk=dataset_kwargs.get("training_desks"),
-            random_starting_index=True,
-            mirroring_room=True, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
+            random_starting_index=False,
+            mirroring_room=False, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
             gaussian_noise=True,
         )
 
@@ -1043,7 +1043,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             warmup_ratio=warmup_ratio,
             optim="adamw_torch_fused",
             logging_strategy="steps",
-            logging_steps=25,
+            logging_steps=50,
             disable_tqdm=False,
             report_to="wandb",
             run_name='chronos2-lo_5',
@@ -1167,7 +1167,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
                                     # recipes list might be huge, accessing by index is safe
                                     recipe = eval_dataset.recipes[dataset_idx]
                                     # Recipe: ([(file, start_idx)...], slice_idx, shift, label_bits)
-                                    ingredients, slice_idx, shift, label_bits = recipe
+                                    # ingredients, slice_idx, shift, label_bits = recipe
+                                    ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored = recipe
                                     recipe_info = (f"Ingredients: {ingredients}, Slice: {slice_idx}, "
                                                    f"Shift: {shift}, LabelBits: {label_bits}")
                                 except Exception as e:

@@ -696,6 +696,12 @@ class ChronosClassificationCollate:
                 '5': [40, 29, 16, 19], # 
                 '6': [40, 19, 16, 29], # 
             },
+            "deployment9": {
+                '1': [13, 36, 27, 20], '2': [13, 22, 26, 32], '3': [25, 36, 14, 19], '4': [24, 21, 14, 32]
+            },
+            "deployment10": {
+                '1': [25, 35, 14, 19], '2': [13, 34, 26, 20], '3': [24, 20, 14, 32], '4': [12, 21, 28, 33]
+            },
         }
         
         self.deployment_min_max = {}
@@ -795,6 +801,12 @@ class ChronosSupConCollate:
             "deployment8": {
                 '1': [14, 31, 45, 20], '2': [14, 21, 45, 30], '3': [25, 29, 29, 17],
                 '4': [24, 18, 29, 27], '5': [40, 29, 16, 19], '6': [40, 19, 16, 29],
+            },
+            "deployment9": {
+                '1': [13, 36, 27, 20], '2': [13, 22, 26, 32], '3': [25, 36, 14, 19], '4': [24, 21, 14, 32]
+            },
+            "deployment10": {
+                '1': [25, 35, 14, 19], '2': [13, 34, 26, 20], '3': [24, 20, 14, 32], '4': [12, 21, 28, 33]
             },
         }
         
@@ -1432,7 +1444,7 @@ class SyntheticSignalDataset(Dataset):
                     view_sig += blending_alpha * neg_slice
                 
                 if self.gaussian_noise:
-                    sigma = 0.05
+                    sigma = 0.02
                     if np.iscomplexobj(view_sig):
                         noise = np.random.normal(0, sigma, view_sig.shape) + 1j * np.random.normal(0, sigma, view_sig.shape)
                     else:
@@ -1528,6 +1540,12 @@ class MultiDeskCollate:
             "deployment8": {
                 '1': [14, 31, 45, 20], '2': [14, 21, 45, 30], '3': [25, 29, 29, 17],
                 '4': [24, 18, 29, 27], '5': [40, 29, 16, 19], '6': [40, 19, 16, 29],
+            },
+            "deployment9": {
+                '1': [13, 36, 27, 20], '2': [13, 22, 26, 32], '3': [25, 36, 14, 19], '4': [24, 21, 14, 32]
+            },
+            "deployment10": {
+                '1': [25, 35, 14, 19], '2': [13, 34, 26, 20], '3': [24, 20, 14, 32], '4': [12, 21, 28, 33]
             },
         }
 
@@ -1836,12 +1854,12 @@ class MultiDeskDataset(Dataset):
 
 if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")
-    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment7"], lpf_cutoff=2.0)
+    manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment9"], lpf_cutoff=3.0)
     ds = SyntheticSignalDataset(manifest, n_channels=4, 
                                 synthesis_mode=False, aug_layout_testing=False,
                                 augment_phase=False, augment_time_warp=False,
-                                window_size=1024, stride=256, max_recipes=20000, desk=[[]],
-                                aug_layout_training=False, random_starting_index=True, mirroring_room=False)
+                                window_size=1536, stride=256, max_recipes=20000, desk=[[], []],
+                                aug_layout_training=False, random_starting_index=False, mirroring_room=False)
     print(len(ds))
     for i in range(len(ds)):
         sig, lab, idx, meta = ds[i]

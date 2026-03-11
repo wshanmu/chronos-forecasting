@@ -804,17 +804,30 @@ class Chronos2ModelClassification(Chronos2Model):
         # Remove the forecasting head to save memory/VRAM
         del self.output_patch_embedding
         self.context_length = config.chronos_config["context_length"]
+        patch_size_stats = self.chronos_config.__dict__.get("patch_size_stats", 32)
         if self.output_all_hidden_states:
             self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
         else:
-            self.final_dim = (self.model_dim + 2 + self.context_length//32 * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
+            self.final_dim = (self.model_dim + 2 + self.context_length//patch_size_stats * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
         self.classification_head = nn.Sequential(
-            nn.Linear(self.final_dim, 64),
+            nn.Linear(self.final_dim, 512),
             nn.ReLU(),
-            # nn.Linear(512, 64),
-            # nn.ReLU(),
+            nn.Linear(512, 64),
+            nn.ReLU(),
             nn.Linear(64, self.num_classes),
         )
+        # self.classification_head = nn.Sequential(
+        #     nn.Linear(self.final_dim, 256),
+        #     nn.BatchNorm1d(256),
+        #     nn.ReLU(),
+        #     nn.Dropout(p=0.2),
+            
+        #     nn.Linear(256, 64),
+        #     nn.ReLU(),
+        #     nn.Dropout(p=0.2),
+            
+        #     nn.Linear(64, self.num_classes),
+        # )
 
         self.supcon_mode = False
         self.projection_head = nn.Sequential(
@@ -881,9 +894,9 @@ class Chronos2ModelClassification(Chronos2Model):
         if bin_centers is not None:
             import math
             # 1. Normalization
-            norm_centers = (bin_centers.float() - 10.0) / (54.0 - 10.0)
+            norm_centers = (bin_centers.float() - 2.0) / (54.0 - 2.0)  # In the implementation, 2 is the LoS path
             norm_centers = torch.clamp(norm_centers, 0.0, 1.0)
-                
+
             # 2. Spectral Expansion
             k_exp = torch.pow(2.0, torch.arange(10, device=bin_centers.device, dtype=torch.float32))
 
@@ -1109,11 +1122,23 @@ class Chronos2ModelClassificationMultiDesk(Chronos2Model):
             self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
         else:
             self.final_dim = (self.model_dim + 2 + self.context_length//32 * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
-        self.classification_head = nn.Sequential(
-            nn.Linear(self.final_dim, 64),
-            nn.ReLU(),
-            nn.Linear(64, self.num_classes),
-        )
+        # self.classification_head = nn.Sequential(
+        #     nn.Linear(self.final_dim, 64),
+        #     nn.ReLU(),
+        #     nn.Linear(64, self.num_classes),
+        # )
+        # self.classification_head = nn.Sequential(
+        #     nn.Linear(self.final_dim, 256),
+        #     nn.BatchNorm1d(256),
+        #     nn.ReLU(),
+        #     nn.Dropout(p=0.2),
+            
+        #     nn.Linear(256, 64),
+        #     nn.ReLU(),
+        #     nn.Dropout(p=0.2),
+            
+        #     nn.Linear(64, self.num_classes),
+        # )
 
         self.supcon_mode = False
         self.multiDesk = True
