@@ -1025,7 +1025,8 @@ class SyntheticSignalDataset(Dataset):
                  supcon_mode: bool = False,
                  random_starting_index: bool = False,
                  mirroring_room: bool = False,
-                 gaussian_noise: bool = False):
+                 gaussian_noise: bool = False,
+                 ghost_augment: bool = True):
         """
         Args:
             manifest: Populated DataManifest.
@@ -1089,7 +1090,8 @@ class SyntheticSignalDataset(Dataset):
         self.random_starting_index = random_starting_index
         self.mirroring_room = mirroring_room
         self.gaussian_noise = gaussian_noise
-        
+        self.ghost_augment = ghost_augment
+
         # --- Mode Switching ---
         if synthesis_mode:
             self._build_training_recipes(manifest, max_recipes)
@@ -1201,8 +1203,9 @@ class SyntheticSignalDataset(Dataset):
                             # Augmented recipe: flag it, keep it un-paired for now
                             # Skip adding explicit augmented recipes if supcon_mode is True,
                             # because SupCon generates matched augmented views pairs dynamically.
-                            if not self.supcon_mode and len(neg_pools[slice_idx]) > 0:
-                                self.recipes.append(([seg], slice_idx, shift, lbl, layout, True, is_mirrored))
+                            if self.ghost_augment:
+                                if not self.supcon_mode and len(neg_pools[slice_idx]) > 0:
+                                    self.recipes.append(([seg], slice_idx, shift, lbl, layout, True, is_mirrored))
         
         if max_recipes and len(self.recipes) > max_recipes:
             rng = np.random.default_rng(42)
@@ -1856,10 +1859,10 @@ if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")
     manifest = DataManifest(root_dir="./tdma_sensing/cir_files/processed_cir", layouts=["deployment9"], lpf_cutoff=3.0)
     ds = SyntheticSignalDataset(manifest, n_channels=4, 
-                                synthesis_mode=False, aug_layout_testing=False,
+                                synthesis_mode=True, aug_layout_testing=False,
                                 augment_phase=False, augment_time_warp=False,
                                 window_size=1536, stride=256, max_recipes=20000, desk=[[], []],
-                                aug_layout_training=False, random_starting_index=False, mirroring_room=False)
+                                aug_layout_training=False, random_starting_index=False, mirroring_room=False, ghost_augment=False)
     print(len(ds))
     for i in range(len(ds)):
         sig, lab, idx, meta = ds[i]

@@ -809,6 +809,7 @@ class Chronos2ModelClassification(Chronos2Model):
             self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
         else:
             self.final_dim = (self.model_dim + 2 + self.context_length//patch_size_stats * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
+            # self.final_dim = (self.model_dim + 2) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
         self.classification_head = nn.Sequential(
             nn.Linear(self.final_dim, 512),
             nn.ReLU(),
@@ -1034,8 +1035,8 @@ class Chronos2ModelClassification(Chronos2Model):
         # patch_stats is the statistics for each patch, Shape: (batch_size, num_patches, 4)]
         patch_stats = patch_stats.view(batch_size, -1)
 
-        hidden_states: torch.Tensor = encoder_outputs[0]
-        assert hidden_states.shape == (batch_size, num_context_patches + 1, self.model_dim)
+        # hidden_states: torch.Tensor = encoder_outputs[0]
+        # assert hidden_states.shape == (batch_size, num_context_patches + 1, self.model_dim)
 
         all_hidden_states = encoder_outputs.all_hidden_states # 12*[B*N, num_patches, d_model]
         pooled = [torch.mean(layer, dim=1) for layer in all_hidden_states]
@@ -1047,6 +1048,7 @@ class Chronos2ModelClassification(Chronos2Model):
             combined_features = pooled[-1]
 
         combined_features_with_statistics = torch.cat([combined_features, loc_scale_tensor, patch_stats], dim=1) # Shape: [batch*num_vars, d_model * 12 + 2]
+        # combined_features_with_statistics = torch.cat([combined_features, loc_scale_tensor], dim=1) # Shape: [batch*num_vars, d_model * 12 + 2]
         
         ## If we want to mean pool over I/Q per link:
         # combined_features_with_statistics = combined_features_with_statistics.view(batch_size // 8, 2, 4, -1) # 4 is num_vars TODO: make this dynamic based on group_ids

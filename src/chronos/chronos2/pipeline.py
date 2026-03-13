@@ -823,6 +823,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         model_update_kwargs: dict = None,
         linear_probe: bool = False,
         gradient_accumulation_steps: int = 1,
+        save: bool = False,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         """
@@ -987,6 +988,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             random_starting_index=False,
             mirroring_room=False, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
             gaussian_noise=True,
+            ghost_augment=dataset_kwargs.get("ghost_augment", True), 
         )
 
         sampler = None
@@ -1054,7 +1056,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             bf16=has_sm80 and not use_cpu,
             save_only_model=True,
             prediction_loss_only=False,
-            save_total_limit=1,
+            save_total_limit=10,
             save_strategy="no",
             save_steps=None,
             eval_strategy="no",
@@ -1083,16 +1085,18 @@ class Chronos2Pipeline(BaseChronosPipeline):
             )
 
             # set validation parameters
-            # training_kwargs["save_strategy"] = "steps"
-            # training_kwargs["save_steps"] = 100
+            if save:
+                training_kwargs["save_strategy"] = "steps"
+                training_kwargs["save_steps"] = 25
             training_kwargs["eval_strategy"] = "steps"
             training_kwargs["eval_steps"] = 25
-            training_kwargs["load_best_model_at_end"] = False  # disable final step model saving
+            training_kwargs["load_best_model_at_end"] = save  # disable final step model saving
             training_kwargs["metric_for_best_model"] = "eval_loss"
             training_kwargs["label_names"] = ["labels"]
 
             # add callback to ensure that the final model is evaluated
-            # callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
+            if save:
+                callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
 
         training_kwargs.update(extra_trainer_kwargs)
 
