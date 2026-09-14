@@ -8,6 +8,7 @@ import math
 import time
 import warnings
 from copy import deepcopy
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Literal, Mapping, Sequence, List
 
@@ -16,13 +17,14 @@ import torch
 from einops import rearrange, repeat
 from torch.utils.data import DataLoader
 from transformers import AutoConfig
+from transformers.trainer_utils import seed_worker
 from transformers.utils.import_utils import is_peft_available
 from transformers.utils.peft_utils import find_adapter_config_file
 
 import chronos.chronos2
 from chronos.base import BaseChronosPipeline, ForecastType
-from .model import Chronos2Model, Chronos2ModelClassification, Chronos2ModelClassificationMultiDesk
-from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, TensorOrArray, ChronosClassificationCollate, ChronosSupConCollate, DataManifest, SyntheticSignalDataset, MultiDeskCollate, MultiDeskDataset
+from .model import Chronos2Model, Chronos2ModelClassification, Chronos2ModelClassificationJoint, Chronos2ModelClassificationMultiDesk
+from chronos.chronos2.dataset import Chronos2Dataset, DatasetMode, TensorOrArray, ChronosClassificationCollate, ChronosSupConCollate, DataManifest, SyntheticSignalDataset, MultiDeskCollate, MultiDeskDataset, RoomWindowDataset, RoomWindowCollate
 from chronos.df_utils import convert_df_input_to_list_of_dicts_input
 from chronos.utils import interpolate_quantiles, weighted_quantile
 
@@ -40,6 +42,328 @@ if TYPE_CHECKING:
     from transformers.trainer_callback import TrainerCallback
 
 logger = logging.getLogger(__name__)
+
+
+def _infer_dataset_n_channels(model_n_channels: int, dataset_kwargs: dict) -> int:
+    raw_n_channels = dataset_kwargs.get("raw_n_channels")
+    if raw_n_channels is not None:
+        return int(raw_n_channels)
+
+    stack_factor = 2 if dataset_kwargs.get("convert_complex_to_float", "I_Q") in ("I_Q", "mag_phase") else 1
+    return max(1, int(model_n_channels) // stack_factor)
+
+
+def _compute_per_desk_stats(desk_keys, labels, predictions, probs=None, key_name="desk"):
+    """
+    Confusion-matrix counts and derived rates for each group of samples separately.
+
+    `desk_keys` is any per-sample grouping label -- a desk id for the per-desk breakdown, an
+    occupancy bucket for the occupancy breakdown. Returns a list of dicts, one per group,
+    sorted by key. Binary counts (tp/fp/tn/fn) are only meaningful for the 2-class case; for
+    multi-class only support/accuracy are filled in.
+    """
+    desk_keys = np.asarray(desk_keys)
+    labels = np.asarray(labels)
+    predictions = np.asarray(predictions)
+
+    is_binary = set(np.unique(labels)).issubset({0, 1}) and set(np.unique(predictions)).issubset({0, 1})
+
+    rows = []
+    for desk in sorted(set(desk_keys.tolist())):
+        mask = desk_keys == desk
+        y_true = labels[mask]
+        y_pred = predictions[mask]
+
+        row = {
+            key_name: desk,
+            "support": int(mask.sum()),
+            "n_occupied": int((y_true == 1).sum()) if is_binary else int(len(y_true)),
+            "accuracy": float(accuracy_score(y_true, y_pred)) if len(y_true) else float("nan"),
+        }
+
+        if is_binary:
+            tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+            tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)
+            row.update(
+                tp=tp,
+                fp=fp,
+                tn=tn,
+                fn=fn,
+                # recall / TPR, i.e. fraction of occupied windows that were caught
+                recall=tp / (tp + fn) if (tp + fn) else float("nan"),
+                precision=tp / (tp + fp) if (tp + fp) else float("nan"),
+                # specificity / TNR, i.e. fraction of empty windows kept empty
+                specificity=tn / (tn + fp) if (tn + fp) else float("nan"),
+                fpr=fp / (tn + fp) if (tn + fp) else float("nan"),
+                f1=float(f1_score(y_true, y_pred, zero_division=0)),
+            )
+
+            if probs is not None:
+                y_prob = np.asarray(probs)[mask]
+                try:
+                    row["auc"] = float(roc_auc_score(y_true, y_prob))
+                except ValueError:
+                    # a desk that is all-occupied or all-empty has no defined AUC
+                    row["auc"] = float("nan")
+
+        rows.append(row)
+
+    return rows
+
+
+def _format_per_desk_table(rows, key_name="desk") -> str:
+    if not rows:
+        return "(no stats)"
+
+    columns = [key_name, "support", "n_occupied", "tp", "fp", "tn", "fn",
+               "accuracy", "precision", "recall", "specificity", "fpr", "f1", "auc"]
+    columns = [c for c in columns if any(c in row for row in rows)]
+    widths = {c: max(len(c), *(len(_fmt_cell(row.get(c))) for row in rows)) for c in columns}
+
+    lines = ["  ".join(c.rjust(widths[c]) for c in columns)]
+    lines.append("  ".join("-" * widths[c] for c in columns))
+    for row in rows:
+        lines.append("  ".join(_fmt_cell(row.get(c)).rjust(widths[c]) for c in columns))
+
+    return "\n".join(lines)
+
+
+def _fmt_cell(value) -> str:
+    if value is None:
+        return "-"
+    if isinstance(value, float):
+        return f"{value:.4f}"
+    return str(value)
+
+
+def _occupancy_bucket(label_bits, desk_idx: int) -> str:
+    """
+    How many OTHER desks are occupied in this window.
+
+    This is the variable that dominates the error rate: with the rest of the room empty
+    the per-desk model is near-perfect, and it degrades steadily as neighbours fill up.
+    Reporting accuracy sliced by it is the only way to see whether a change actually
+    helps the multi-occupancy regime rather than the easy one.
+    """
+    others = sum(1 for i, bit in enumerate(label_bits) if i != desk_idx and bit == '1')
+    return f"k={others}"
+
+
+def _desk_meta_from_recipes(eval_dataset, n_predictions: int):
+    """
+    Per-prediction (desk, occupancy) metadata for the per-desk `SyntheticSignalDataset`.
+
+    A recipe is (ingredients, slice_idx, shift, label_bits, layout, is_augmented, is_mirrored),
+    so desk identity is (layout, slice_idx + 1) -- desks are 1-indexed in the config. When TTA
+    is enabled the dataset holds several consecutive views per real sample, so we take one
+    recipe per group. Returns None if the recipes cannot be lined up with the predictions.
+    """
+    recipes = getattr(eval_dataset, "recipes", None)
+    if not recipes or n_predictions <= 0:
+        return None
+
+    if len(recipes) % n_predictions != 0:
+        logger.warning(
+            f"Skipping evaluation breakdowns: {len(recipes)} eval recipes are not a multiple "
+            f"of {n_predictions} predictions (distributed eval pads the last batch)."
+        )
+        return None
+
+    group_size = len(recipes) // n_predictions
+    meta = []
+    for idx in range(0, len(recipes), group_size):
+        try:
+            _, slice_idx, _, label_bits, layout, _, _ = recipes[idx]
+        except (ValueError, TypeError) as exc:
+            logger.warning(f"Skipping evaluation breakdowns: unexpected recipe format ({exc}).")
+            return None
+        slice_idx = int(slice_idx)
+        # A "segment" is one time window of one recording: the same (file, start)
+        # appears once per desk. Grouping predictions by it reconstructs the whole
+        # room at that instant, which is what the people-count MAE needs.
+        try:
+            seg_file, seg_start = recipes[idx][0][0]
+            segment = f"{Path(seg_file).name}@{seg_start}"
+        except Exception:
+            segment = None
+        meta.append({
+            "desk": f"{layout}/desk{slice_idx + 1}",
+            "occupancy": _occupancy_bucket(label_bits, slice_idx),
+            "segment": segment,
+            "layout": layout,
+            "slice_idx": slice_idx,
+            "n_desks": len(label_bits),
+            "gt_occupied": sum(int(b) for b in label_bits),
+        })
+    return meta
+
+
+def _room_desk_meta_from_recipes(eval_dataset, n_items: int, d_max: int):
+    """
+    Metadata for the joint `RoomWindowDataset`, flattened to match logits [N, D_max, ...].
+
+    Returns a flat list of length n_items * d_max whose entries are None in the padded desk
+    slots, so the caller can mask it with exactly the same `labels != -100` test it uses on
+    the predictions.
+    """
+    recipes = getattr(eval_dataset, "recipes", None)
+    if not recipes or n_items <= 0:
+        return None
+
+    if len(recipes) != n_items:
+        logger.warning(
+            f"Skipping evaluation breakdowns: {len(recipes)} eval room-windows vs "
+            f"{n_items} predicted items."
+        )
+        return None
+
+    meta = []
+    for ingredients, shift, label_bits, layout, is_mirrored in recipes:
+        for d in range(d_max):
+            if d >= len(label_bits):
+                meta.append(None)          # padded desk slot
+                continue
+            meta.append({
+                "desk": f"{layout}/desk{d + 1}",
+                "occupancy": _occupancy_bucket(label_bits, d),
+            })
+    return meta
+
+
+def _people_count_metrics(eval_meta, labels, predictions, *, output_dir,
+                          should_report, filename="people_count.txt"):
+    """
+    Room-occupancy count error: |#desks predicted occupied - #actually occupied|,
+    per time window, averaged. This is the "capacity estimation error (MAE)" that
+    error_analysis_for_LODesk.plot_people_count_confusion_matrix reports.
+
+    It is a WHOLE-ROOM metric: a window contributes only if every desk of its
+    layout was predicted in this eval pass. A leave-one-DESK-out run evaluates a
+    single desk, so no window is ever complete and this returns {} -- for that
+    setting the MAE has to be assembled across the per-desk runs afterwards (see
+    the predictions CSV written alongside).
+    """
+    if not eval_meta:
+        return {}
+
+    segs = {}
+    for m, lab, pred in zip(eval_meta, labels, predictions):
+        if m is None or m.get("segment") is None:
+            continue
+        key = (m["layout"], m["segment"])
+        e = segs.setdefault(key, {"n_desks": m["n_desks"], "seen": set(),
+                                  "est": 0, "gt": 0})
+        if m["slice_idx"] in e["seen"]:      # TTA/duplicate guard
+            continue
+        e["seen"].add(m["slice_idx"])
+        e["est"] += int(pred)
+        e["gt"] += int(lab)
+
+    complete = [e for e in segs.values() if len(e["seen"]) == e["n_desks"]]
+    if not complete:
+        if should_report:
+            print(f"People-count MAE: skipped -- 0 of {len(segs)} eval windows have "
+                  f"all their desks (expected when evaluating a single desk).", flush=True)
+        return {}
+
+    err = np.array([abs(e["gt"] - e["est"]) for e in complete], dtype=float)
+    gt = np.array([e["gt"] for e in complete])
+    est = np.array([e["est"] for e in complete])
+    mae = float(err.mean())
+    exact = float((err == 0).mean())
+
+    if should_report:
+        lines = [f"windows: {len(complete)} complete of {len(segs)}",
+                 f"MAE: {mae:.4f} people    exact-count accuracy: {exact:.4f}",
+                 "", f"{'true':>6s} {'n':>5s} {'exact':>8s} {'MAE':>8s} {'mean est':>9s}"]
+        for t in sorted(set(gt.tolist())):
+            sel = gt == t
+            lines.append(f"{t:6d} {int(sel.sum()):5d} {float((err[sel]==0).mean()):8.3f} "
+                         f"{float(err[sel].mean()):8.3f} {float(est[sel].mean()):9.2f}")
+        table = "\n".join(lines)
+        print(f"People-count (capacity) estimation:\n{table}", flush=True)
+        try:
+            Path(output_dir).mkdir(parents=True, exist_ok=True)
+            with open(Path(output_dir) / filename, "a") as f:
+                f.write(f"\n--- People-count estimation ({time.strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
+                f.write(table + "\n")
+        except Exception as exc:
+            logger.warning(f"Could not write {filename}: {exc}")
+
+    return {"people_mae": mae, "people_exact": exact,
+            "people_windows": float(len(complete))}
+
+
+def _dump_eval_predictions(eval_meta, labels, predictions, probs, *, output_dir,
+                           filename="eval_predictions.csv"):
+    """
+    One row per eval prediction: enough to rebuild any aggregate offline.
+
+    This is what makes the leave-one-desk-out MAE possible: each per-desk run
+    writes its own slice of the room, and the desks are stitched back together by
+    (layout, segment) across runs.
+    """
+    if not eval_meta:
+        return None
+    path = Path(output_dir) / filename
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w") as f:
+            f.write("layout,segment,desk,slice_idx,label,pred,prob,n_desks,gt_occupied\n")
+            for i, m in enumerate(eval_meta):
+                if m is None:
+                    continue
+                pr = "" if probs is None else f"{float(probs[i]):.6f}"
+                f.write(f"{m['layout']},{m['segment']},{m['desk']},{m['slice_idx']},"
+                        f"{int(labels[i])},{int(predictions[i])},{pr},"
+                        f"{m['n_desks']},{m['gt_occupied']}\n")
+        return path
+    except Exception as exc:
+        logger.warning(f"Could not write {filename}: {exc}")
+        return None
+
+
+def _emit_breakdown(*, title, key_name, keys, labels, predictions, probs,
+                    output_dir, filename, metric_prefix, should_report,
+                    wandb_table_key=None):
+    """
+    Compute one sliced breakdown, report it, and return it as flat scalar metrics.
+
+    Shared by the per-desk and by-occupancy slices, and by both the per-desk and the joint
+    training entry points, so all four report identically.
+    """
+    rows = _compute_per_desk_stats(keys, labels, predictions, probs=probs, key_name=key_name)
+    if not rows:
+        return {}
+
+    if should_report:
+        table = _format_per_desk_table(rows, key_name=key_name)
+        print(f"{title}:\n{table}", flush=True)
+        try:
+            with open(Path(output_dir) / filename, "a") as f:
+                f.write(f"\n--- {title} ({time.strftime('%Y-%m-%d %H:%M:%S')}) ---\n")
+                f.write(table + "\n")
+        except Exception as exc:
+            print(f"Warning: Failed to write {filename} to {output_dir}: {exc}")
+
+        if wandb_table_key is not None and wandb.run is not None:
+            try:
+                columns = list(rows[0].keys())
+                wandb.log({wandb_table_key: wandb.Table(
+                    columns=columns,
+                    data=[[row.get(c) for c in columns] for row in rows],
+                )})
+            except Exception as exc:
+                print(f"Warning: failed to log W&B table {wandb_table_key}: {exc}", flush=True)
+
+    metrics = {}
+    for row in rows:
+        suffix = str(row[key_name]).replace("/", "_").replace("=", "")
+        for key, value in row.items():
+            if key == key_name:
+                continue
+            metrics[f"{metric_prefix}{suffix}_{key}"] = float(value)
+    return metrics
 
 
 class Chronos2Pipeline(BaseChronosPipeline):
@@ -394,6 +718,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
         gradient_accumulation_steps: int = 1,
         dataset_kwargs: dict = None,
         model_update_kwargs: dict = None,
+        # Seeds the Trainer itself (batch order + augmentation),
+        # not just the model init the caller already seeded.
+        seed: int = 42,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         """
@@ -519,12 +846,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
         dataset_kwargs = dataset_kwargs or {}
         # extract 'root' from dataset_kwargs if it exists, else use the hardcoded path.
         dataset_root = dataset_kwargs.pop('root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir')
+        dataset_n_channels = _infer_dataset_n_channels(n_channels, dataset_kwargs)
 
         train_manifest = DataManifest(dataset_root, layouts=train_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
         # Using dataset_params (DictConfig) directly
         train_dataset = SyntheticSignalDataset(
             train_manifest,
-            n_channels=4, 
+            n_channels=dataset_n_channels, 
             synthesis_mode=dataset_kwargs.get("training_synthesis_mode", True),
             supcon_mode=True, 
             aug_layout_training=dataset_kwargs.get("train_augment_layout", True),
@@ -605,6 +933,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
             disable_tqdm=False,
             report_to="wandb",
             run_name='chronos2-supcon',
+            # Without this TrainingArguments.seed defaults to 42 and
+            # Trainer.__init__ calls set_seed(42) AFTER the model is built, so
+            # the caller's set_seed(training.seed) survived only in the freshly
+            # initialised head -- batch order and every augmentation draw were
+            # identical for every "seed". Passing it here makes the seed govern
+            # the whole run.
+            seed=seed,
             max_steps=num_steps,
             gradient_accumulation_steps=gradient_accumulation_steps,
             dataloader_num_workers=0,
@@ -629,7 +964,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             test_manifest = DataManifest(dataset_root, layouts=validation_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
             eval_dataset = SyntheticSignalDataset(
                 test_manifest,
-                n_channels=4, 
+                n_channels=dataset_n_channels, 
                 synthesis_mode=True,
                 supcon_mode=True, 
                 aug_layout_training=False,
@@ -750,15 +1085,29 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 
                 # Use standard Dataloader with our custom sampler
                 # Note: shuffle must be False when sampler is used
-                return DataLoader(
-                    self.train_dataset,
+                # torch's _worker_loop already reseeds numpy per worker
+                # (np.random.seed(_generate_state(base_seed, worker_id))), so
+                # augmentation streams are independent either way. seed_worker
+                # is added for parity with Trainer._get_dataloader, which sets
+                # it on every training loader; it also carries persistent_workers
+                # and prefetch_factor, which this hand-built loader dropped.
+                params = dict(
                     batch_size=self.args.train_batch_size,
-                    sampler=sampler, 
+                    sampler=sampler,
                     collate_fn=self.data_collator,
                     drop_last=self.args.dataloader_drop_last,
                     num_workers=self.args.dataloader_num_workers,
                     pin_memory=self.args.dataloader_pin_memory,
+                    worker_init_fn=partial(
+                        seed_worker,
+                        num_workers=self.args.dataloader_num_workers,
+                        rank=self.args.process_index,
+                    ),
                 )
+                if self.args.dataloader_num_workers > 0:
+                    params["persistent_workers"] = self.args.dataloader_persistent_workers
+                    params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+                return DataLoader(self.train_dataset, **params)
 
         TrainerClass = WeightedTrainer if train_weighted_sampler else Trainer
 
@@ -817,13 +1166,23 @@ class Chronos2Pipeline(BaseChronosPipeline):
         disable_data_parallel: bool = True,
         n_classes: int = 2,
         n_channels: int = 8,
+        num_frequencies: int = 6,
         eval_layout_augmentation: bool = False,
+        eval_mirror_augmentation: bool = False,
+        eval_steps: int = 25,
         train_weighted_sampler: bool = False,
         dataset_kwargs: dict = None,
         model_update_kwargs: dict = None,
         linear_probe: bool = False,
         gradient_accumulation_steps: int = 1,
         save: bool = False,
+        dataloader_num_workers: int = 0,
+        dataloader_persistent_workers: bool | None = None,
+        dataloader_prefetch_factor: int | None = None,
+        dataloader_pin_memory: bool = True,
+        # Seeds the Trainer itself (batch order + augmentation),
+        # not just the model init the caller already seeded.
+        seed: int = 42,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         """
@@ -863,6 +1222,14 @@ class Chronos2Pipeline(BaseChronosPipeline):
             If True, ensures that DataParallel is disabled and training happens on a single GPU
         eval_layout_augmentation
             If True, evaluating with 4x samples (augmented with layout shifts) and averaging the logits.
+        eval_mirror_augmentation
+            If True, evaluate each sample twice -- as recorded and room-mirrored (links 1 and 3
+            swapped in the signal, bin centres and geometry alike) -- and average the two
+            softmax PROBABILITIES into one prediction. Combines with `eval_layout_augmentation`
+            for 4 x 2 = 8 views per sample.
+            NOTE: only label-preserving if the link-1/link-3 reflection is a real symmetry of
+            the deployment. Where it is not, the mirrored view is off-manifold and averaging it
+            in can hurt; check per room before trusting it.
         linear_probe
             If True, performs linear probing by freezing the backbone network and only training the classification head.
             When enabled, all parameters except those in the classification_head are frozen, by default False
@@ -901,7 +1268,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
         # Create a copy of the model to avoid modifying the original
         config = deepcopy(self.model.config)
         config.chronos_config["context_length"] = context_length # Update pretrained model's config, for correct following initialization
-        
+        config.chronos_config["num_frequencies"] = num_frequencies
+
         output_all_hidden_states = False
         if model_update_kwargs:
             config.chronos_config.update(model_update_kwargs)
@@ -962,12 +1330,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
         dataset_kwargs = dataset_kwargs or {}
         # extract 'root' from dataset_kwargs if it exists, else use the hardcoded path.
         dataset_root = dataset_kwargs.pop('root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir')
+        dataset_n_channels = _infer_dataset_n_channels(n_channels, dataset_kwargs)
 
         train_manifest = DataManifest(dataset_root, layouts=train_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
         # Using dataset_params (DictConfig) directly
         train_dataset = SyntheticSignalDataset(
             train_manifest,
-            n_channels=4, 
+            n_channels=dataset_n_channels, 
             synthesis_mode=dataset_kwargs.get("training_synthesis_mode", True), 
             aug_layout_training=dataset_kwargs.get("train_augment_layout", True),
             max_recipes=dataset_kwargs.get("train_max_recipe", 20000), 
@@ -986,7 +1355,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
             augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
             desk=dataset_kwargs.get("training_desks"),
             random_starting_index=False,
-            mirroring_room=False, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
+            # if True, doubles the dataset with a link 1<->3 swap (8x when layout aug is on too)
+            mirroring_room=dataset_kwargs.get("mirror_room", False),
             gaussian_noise=True,
             ghost_augment=dataset_kwargs.get("ghost_augment", True), 
         )
@@ -1049,9 +1419,40 @@ class Chronos2Pipeline(BaseChronosPipeline):
             disable_tqdm=False,
             report_to="wandb",
             run_name='chronos2-lo_5',
+            # Without this TrainingArguments.seed defaults to 42 and
+            # Trainer.__init__ calls set_seed(42) AFTER the model is built, so
+            # the caller's set_seed(training.seed) survived only in the freshly
+            # initialised head -- batch order and every augmentation draw were
+            # identical for every "seed". Passing it here makes the seed govern
+            # the whole run.
+            seed=seed,
             max_steps=num_steps,
             gradient_accumulation_steps=gradient_accumulation_steps,
-            dataloader_num_workers=0,
+            # Augmentation (time warp, blending, range-gate offsets) is pure
+            # Python/numpy and at num_workers=0 runs inline in the training
+            # loop, so each step is load-then-compute and the card waits out
+            # the load. Measured A/B at GBS32, ctx1536, 60 steps, seed 7:
+            #   num_workers=0 -> 33.3, 38.2 samples/s
+            #   num_workers=8 -> 50.0, 48.1 samples/s   (~1.37x)
+            #
+            # CAUTION: the worker count changes the augmentation RNG stream.
+            # The same A/B gives train_loss 0.46324548721313474 at 0 workers
+            # and 0.431561279296875 at 8, each reproducible to the last digit.
+            # Runs are therefore comparable only within one worker count --
+            # never change this partway through a sweep, and do not compare
+            # new runs against a corpus collected at a different value.
+            dataloader_num_workers=dataloader_num_workers,
+            dataloader_persistent_workers=(
+                dataloader_num_workers > 0
+                if dataloader_persistent_workers is None
+                else dataloader_persistent_workers
+            ),
+            dataloader_prefetch_factor=(
+                (4 if dataloader_prefetch_factor is None else dataloader_prefetch_factor)
+                if dataloader_num_workers > 0
+                else None
+            ),
+            dataloader_pin_memory=dataloader_pin_memory,
             tf32=has_sm80 and not use_cpu,
             bf16=has_sm80 and not use_cpu,
             save_only_model=True,
@@ -1073,9 +1474,10 @@ class Chronos2Pipeline(BaseChronosPipeline):
             test_manifest = DataManifest(dataset_root, layouts=validation_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
             eval_dataset = SyntheticSignalDataset(
                 test_manifest, 
-                n_channels=4, 
+                n_channels=dataset_n_channels, 
                 synthesis_mode=dataset_kwargs.get("test_synthesis_mode", False), 
                 aug_layout_testing=eval_layout_augmentation,
+                mirroring_room=eval_mirror_augmentation,
                 min_max_normalization=False,
                 window_size=context_length,
                 stride=dataset_kwargs.get("stride", 256),
@@ -1087,9 +1489,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
             # set validation parameters
             if save:
                 training_kwargs["save_strategy"] = "steps"
-                training_kwargs["save_steps"] = 25
+                training_kwargs["save_steps"] = eval_steps
             training_kwargs["eval_strategy"] = "steps"
-            training_kwargs["eval_steps"] = 25
+            # Fixed at 25 historically. Made configurable so a sweep over batch size can
+            # hold the NUMBER of evaluations constant: at a small batch a run has many more
+            # optimizer steps, and evaluating every 25 of them turns eval into a third of
+            # the run's wall clock, which would confound batch size with eval overhead.
+            training_kwargs["eval_steps"] = eval_steps
             training_kwargs["load_best_model_at_end"] = save  # disable final step model saving
             training_kwargs["metric_for_best_model"] = "eval_loss"
             training_kwargs["label_names"] = ["labels"]
@@ -1121,28 +1527,39 @@ class Chronos2Pipeline(BaseChronosPipeline):
             if isinstance(logits, tuple):
                 logits = logits[0]
             
-            # --- Aggregation Logic if enabled ---
-            if eval_layout_augmentation:
-                # We expect 4 predictions per original sample
-                # Input shapes: [N_total, C], [N_total] where N_total = 4 * N_real
-                N_total, C = logits.shape
-                assert N_total % 4 == 0, f"Expected total samples to be divisible by 4, got {N_total}"
-                
-                # Reshape to group the 4 views: [N_real, 4, C]
-                logits_grouped = logits.reshape(-1, 4, C)
-                labels_grouped = labels.reshape(-1, 4)
-                
-                # Average logits
-                logits_for_pred = np.mean(logits_grouped, axis=1) # [N_real, C]
+            # --- Test-time augmentation aggregation ---
+            # The eval dataset emits consecutive views per real sample: `aug_layout_testing`
+            # contributes 4 (one per layout shift) and `mirroring_room` contributes 2 (as
+            # recorded / mirrored), so the group size is their product.
+            n_eval_views = (4 if eval_layout_augmentation else 1) * (2 if eval_mirror_augmentation else 1)
+
+            # Averaging happens in PROBABILITY space, not logit space: the views are separate
+            # observations of the same desk, so the quantity to pool is each view's posterior.
+            # Averaging logits instead is a geometric mean of probabilities, which lets one
+            # confidently-wrong view dominate the vote.
+            probs_all = softmax(logits, axis=-1)
+            if n_eval_views > 1:
+                N_total, C = probs_all.shape
+                assert N_total % n_eval_views == 0, (
+                    f"Expected total samples divisible by {n_eval_views} views, got {N_total}"
+                )
+                probs_grouped = probs_all.reshape(-1, n_eval_views, C)
+                labels_grouped = labels.reshape(-1, n_eval_views)
+                probs_for_pred = np.mean(probs_grouped, axis=1)   # [N_real, C]
                 labels_for_pred = labels_grouped[:, 0]            # [N_real]
-                assert np.all(labels_grouped == labels_for_pred[:, None]), "Labels within each group of 4 must be the same"
+                assert np.all(labels_grouped == labels_for_pred[:, None]), (
+                    f"Labels within each group of {n_eval_views} views must be identical"
+                )
+                # Kept only so downstream shape checks and logging still see a logit array.
+                logits_for_pred = np.mean(logits.reshape(-1, n_eval_views, C), axis=1)
             else:
+                probs_for_pred = probs_all
                 logits_for_pred = logits
                 labels_for_pred = labels
             # ------------------------------------
 
-            # Get the class with the highest logit for each sample
-            predictions = np.argmax(logits_for_pred, axis=-1)
+            # Decide from the averaged probabilities.
+            predictions = np.argmax(probs_for_pred, axis=-1)
             
             # Identify Wrong Samples
             wrong_indices = np.where(predictions != labels_for_pred)[0]
@@ -1158,11 +1575,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
                         
                         for i, idx in enumerate(wrong_indices):
                             # Map back to dataset index
-                            if eval_layout_augmentation:
-                                # each prediction corresponds to a block of 4 in dataset
-                                dataset_idx = idx * 4
-                            else:
-                                dataset_idx = idx
+                            # each prediction corresponds to a block of n_eval_views recipes
+                            dataset_idx = idx * n_eval_views
                                 
                             # Retrieve Recipe
                             recipe_info = "Recipe unavailable"
@@ -1206,8 +1620,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 tn = cm.sum() - (tp + fp + fn)
 
             # ROC AUC Score & Best Threshold Search
-            # Apply softmax to get probabilities
-            probs = softmax(logits_for_pred, axis=-1)
+            # Already averaged over TTA views above; do NOT re-softmax.
+            probs = probs_for_pred
             
             best_acc = 0.0
             best_thresh = 0.5
@@ -1288,11 +1702,52 @@ class Chronos2Pipeline(BaseChronosPipeline):
             except ValueError as e:
                  print(f"Warning: Could not calculate AUC or Threshold: {e}")
 
+            # Same predictions, sliced two ways: by desk, and by how many OTHER desks are
+            # occupied. The second slice is where the interesting variation lives.
+            per_desk_metrics = {}
+            eval_meta = _desk_meta_from_recipes(eval_dataset, len(labels_for_pred))
+            if eval_meta is not None:
+                y_prob_for_slice = probs[:, 1] if probs.shape[-1] == 2 else None
+                # every rank sees the same gathered predictions, so only rank 0 reports them
+                should_report = training_args.process_index == 0
+
+                per_desk_metrics.update(_emit_breakdown(
+                    title="Per-desk evaluation stats",
+                    key_name="desk",
+                    keys=[m["desk"] for m in eval_meta],
+                    labels=labels_for_pred, predictions=predictions, probs=y_prob_for_slice,
+                    output_dir=output_dir, filename="desk_stats.txt",
+                    metric_prefix="desk_", should_report=should_report,
+                    wandb_table_key="per_desk_stats" if "wandb" in training_args.report_to else None,
+                ))
+                per_desk_metrics.update(_emit_breakdown(
+                    title="Evaluation stats by occupancy (k = other desks occupied)",
+                    key_name="occupancy",
+                    keys=[m["occupancy"] for m in eval_meta],
+                    labels=labels_for_pred, predictions=predictions, probs=y_prob_for_slice,
+                    output_dir=output_dir, filename="occupancy_stats.txt",
+                    metric_prefix="occ_", should_report=should_report,
+                    wandb_table_key="occupancy_stats" if "wandb" in training_args.report_to else None,
+                ))
+
+                # Whole-room capacity error. Returns {} for a single-desk eval;
+                # the CSV below is how those runs get combined into one later.
+                per_desk_metrics.update(_people_count_metrics(
+                    eval_meta, labels_for_pred, predictions,
+                    output_dir=output_dir, should_report=should_report,
+                ))
+                if should_report:
+                    _dump_eval_predictions(eval_meta, labels_for_pred, predictions,
+                                           y_prob_for_slice, output_dir=output_dir)
+
             # Log the matrix specifically to W&B
             if "wandb" in training_args.report_to:
-                wandb.log({"conf_mat": wandb.plot.confusion_matrix(probs=None,
-                                y_true=labels_for_pred, preds=predictions,
-                                class_names=["Empty", "Occupied"])})
+                try:
+                    wandb.log({"conf_mat": wandb.plot.confusion_matrix(probs=None,
+                                    y_true=labels_for_pred, preds=predictions,
+                                    class_names=["Empty", "Occupied"])})
+                except Exception as exc:
+                    print(f"Warning: failed to log W&B confusion matrix: {exc}", flush=True)
 
             return {
                 "accuracy": acc,
@@ -1304,6 +1759,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 "fp": float(fp),
                 "fn": float(fn),
                 "tn": float(tn),
+                **per_desk_metrics,
             }
 
         # fit entry point to trainer
@@ -1317,15 +1773,29 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 
                 # Use standard Dataloader with our custom sampler
                 # Note: shuffle must be False when sampler is used
-                return DataLoader(
-                    self.train_dataset,
+                # torch's _worker_loop already reseeds numpy per worker
+                # (np.random.seed(_generate_state(base_seed, worker_id))), so
+                # augmentation streams are independent either way. seed_worker
+                # is added for parity with Trainer._get_dataloader, which sets
+                # it on every training loader; it also carries persistent_workers
+                # and prefetch_factor, which this hand-built loader dropped.
+                params = dict(
                     batch_size=self.args.train_batch_size,
-                    sampler=sampler, 
+                    sampler=sampler,
                     collate_fn=self.data_collator,
                     drop_last=self.args.dataloader_drop_last,
                     num_workers=self.args.dataloader_num_workers,
                     pin_memory=self.args.dataloader_pin_memory,
+                    worker_init_fn=partial(
+                        seed_worker,
+                        num_workers=self.args.dataloader_num_workers,
+                        rank=self.args.process_index,
+                    ),
                 )
+                if self.args.dataloader_num_workers > 0:
+                    params["persistent_workers"] = self.args.dataloader_persistent_workers
+                    params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+                return DataLoader(self.train_dataset, **params)
 
         TrainerClass = WeightedTrainer if train_weighted_sampler else Trainer
 
@@ -1364,6 +1834,339 @@ class Chronos2Pipeline(BaseChronosPipeline):
 
         return finetuned_pipeline
 
+    def fit_classifier_joint(
+        self,
+        train_inputs: List[str],
+        validation_inputs: List[str],
+        context_length: int | None = None,
+        learning_rate: float = 1e-4,
+        lr_scheduler_type: str = "cosine",
+        warmup_ratio: float = 0.05,
+        num_steps: int = 1000,
+        batch_size: int = 8,
+        output_dir: Path | str | None = None,
+        callbacks: list["TrainerCallback"] | None = None,
+        remove_printer_callback: bool = False,
+        disable_data_parallel: bool = True,
+        n_classes: int = 2,
+        n_channels: int = 8,
+        num_frequencies: int = 6,
+        dataset_kwargs: dict = None,
+        model_update_kwargs: dict = None,
+        linear_probe: bool = False,
+        gradient_accumulation_steps: int = 1,
+        save: bool = False,
+        # Seeds the Trainer itself (batch order + augmentation),
+        # not just the model init the caller already seeded.
+        seed: int = 42,
+        **extra_trainer_kwargs,
+    ) -> "Chronos2Pipeline":
+        """
+        Fine-tune for JOINT whole-room occupancy classification.
+
+        One training example is one time window of one room. All of that room's desks go into
+        a single attention group, so each desk is classified with its neighbours visible from
+        the first encoder layer instead of in isolation. The head still reads one desk's own
+        variates, so `final_dim` and the head weights are identical to `fit_classifier` and a
+        per-desk checkpoint warm-starts this one.
+
+        Nothing in the model or the collate depends on the desk count, so 4-desk and 6-desk
+        rooms train together in the same batch and a model trained on one desk count runs
+        unmodified on another. Desk identity reaches the model only via `raw_geometry`.
+
+        Compared to `fit_classifier`, one forward pass now yields D predictions instead of 1,
+        so per-desk compute is roughly unchanged while per-item memory grows ~D-fold: reduce
+        `batch_size` by about D and raise `gradient_accumulation_steps` to match.
+        """
+        import torch.cuda
+        from transformers.trainer_callback import PrinterCallback
+        from transformers.training_args import TrainingArguments
+        from transformers import Trainer
+        from chronos.chronos2.trainer import EvaluateAndSaveFinalStepCallback
+
+        if context_length is None:
+            context_length = self.model_context_length
+
+        config = deepcopy(self.model.config)
+        config.chronos_config["context_length"] = context_length
+        config.chronos_config["num_frequencies"] = num_frequencies
+
+        output_all_hidden_states = False
+        if model_update_kwargs:
+            config.chronos_config.update(model_update_kwargs)
+            output_all_hidden_states = model_update_kwargs.get("output_all_hidden_states", False)
+
+        config.chronos_config["n_classes"] = n_classes
+        config.chronos_config["n_channels"] = n_channels
+        config.chronos_config["output_all_hidden_states"] = output_all_hidden_states
+
+        model = Chronos2ModelClassificationJoint(config).to(self.model.device)
+        model.load_state_dict(self.model.state_dict(), strict=False)  # allow missing head
+
+        if linear_probe:
+            for name, param in model.named_parameters():
+                if "classification_head" not in name:
+                    param.requires_grad = False
+            n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            logger.info(f"Linear probing enabled. Trainable parameters: {n_trainable}")
+
+        dataset_kwargs = dataset_kwargs or {}
+        dataset_root = dataset_kwargs.pop(
+            'root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir'
+        )
+        dataset_n_channels = _infer_dataset_n_channels(n_channels, dataset_kwargs)
+
+        train_manifest = DataManifest(
+            dataset_root, layouts=train_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff")
+        )
+        train_dataset = RoomWindowDataset(
+            train_manifest,
+            n_channels=dataset_n_channels,
+            synthesis_mode=dataset_kwargs.get("training_synthesis_mode", True),
+            aug_layout_training=dataset_kwargs.get("train_augment_layout", False),
+            max_recipes=dataset_kwargs.get("train_max_recipe", 20000),
+            augment_phase=dataset_kwargs.get("train_augment_phase", True),
+            augment_phase_step=dataset_kwargs.get("augment_phase_step", 60),
+            augment_time_warp=dataset_kwargs.get("train_augment_time_warp", True),
+            time_warp_num_knots=dataset_kwargs.get("time_warp_num_knots", 6),
+            time_warp_strength=dataset_kwargs.get("time_warp_strength", 12.0),
+            blending_alpha_enabled=dataset_kwargs.get("blending_alpha", True),
+            blending_alpha_range=dataset_kwargs.get("blending_alpha_range", (0.1, 1.1)),
+            min_max_normalization=dataset_kwargs.get("dataset_min_max_norm", False),
+            window_size=context_length,
+            stride=dataset_kwargs.get("stride", 256),
+            convert_complex_to_float=dataset_kwargs.get("convert_complex_to_float", "I_Q"),
+            range_gating_width=dataset_kwargs.get("range_gating_width", 5),
+            augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
+            desk=dataset_kwargs.get("training_desks"),
+            random_starting_index=False,
+            mirroring_room=False,
+            gaussian_noise=True,
+            room_blend=dataset_kwargs.get("room_blend", True),
+            room_blend_per_recipe=dataset_kwargs.get("room_blend_per_recipe", 1),
+            room_blend_occupied_alpha_range=dataset_kwargs.get(
+                "room_blend_occupied_alpha_range", (0.8, 1.2)
+            ),
+        )
+
+        if output_dir is None:
+            output_dir = Path("chronos-2-finetuned") / time.strftime("%Y-%m-%d_%H-%M-%S")
+        elif isinstance(output_dir, str):
+            output_dir = Path(output_dir)
+        assert isinstance(output_dir, Path)
+
+        use_cpu = str(self.model.device) == "cpu"
+        has_sm80 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8
+
+        training_kwargs: dict = dict(
+            output_dir=str(output_dir),
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            lr_scheduler_type=lr_scheduler_type,
+            warmup_ratio=warmup_ratio,
+            optim="adamw_torch_fused",
+            logging_strategy="steps",
+            logging_steps=50,
+            disable_tqdm=False,
+            report_to="wandb",
+            run_name='chronos2-joint',
+            # Without this TrainingArguments.seed defaults to 42 and
+            # Trainer.__init__ calls set_seed(42) AFTER the model is built, so
+            # the caller's set_seed(training.seed) survived only in the freshly
+            # initialised head -- batch order and every augmentation draw were
+            # identical for every "seed". Passing it here makes the seed govern
+            # the whole run.
+            seed=seed,
+            max_steps=num_steps,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+            dataloader_num_workers=0,
+            tf32=has_sm80 and not use_cpu,
+            bf16=has_sm80 and not use_cpu,
+            save_only_model=True,
+            prediction_loss_only=False,
+            save_total_limit=10,
+            save_strategy="no",
+            save_steps=None,
+            eval_strategy="no",
+            eval_steps=None,
+            load_best_model_at_end=False,
+            metric_for_best_model=None,
+            use_cpu=use_cpu,
+            label_names=["labels"],
+        )
+
+        callbacks = callbacks or []
+        eval_dataset = None
+        if validation_inputs is not None:
+            test_manifest = DataManifest(
+                dataset_root, layouts=validation_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff")
+            )
+            eval_dataset = RoomWindowDataset(
+                test_manifest,
+                n_channels=dataset_n_channels,
+                synthesis_mode=dataset_kwargs.get("test_synthesis_mode", False),
+                aug_layout_testing=False,
+                min_max_normalization=False,
+                window_size=context_length,
+                stride=dataset_kwargs.get("stride", 256),
+                range_gating_width=dataset_kwargs.get("range_gating_width", 5),
+                augment_range_gating_offset=dataset_kwargs.get("test_augment_range_gating_offset", False),
+                desk=dataset_kwargs.get("testing_desks"),
+                room_blend=False,
+            )
+
+            if save:
+                training_kwargs["save_strategy"] = "steps"
+                training_kwargs["save_steps"] = 25
+            training_kwargs["eval_strategy"] = "steps"
+            training_kwargs["eval_steps"] = 25
+            training_kwargs["load_best_model_at_end"] = save
+            training_kwargs["metric_for_best_model"] = "eval_loss"
+            if save:
+                callbacks.append(EvaluateAndSaveFinalStepCallback())
+
+        training_kwargs.update(extra_trainer_kwargs)
+
+        if training_kwargs["tf32"]:
+            matmul_tf32 = torch.backends.cuda.matmul.allow_tf32
+            cudnn_tf32 = torch.backends.cudnn.allow_tf32
+
+        training_args = TrainingArguments(**training_kwargs)
+
+        if disable_data_parallel and not use_cpu:
+            training_args._n_gpu = 1
+            assert training_args.n_gpu == 1
+
+        def compute_metrics(eval_pred):
+            logits, labels = eval_pred
+            if isinstance(logits, tuple):
+                logits = logits[0]
+
+            # logits [N_rooms, D_max, n_classes], labels [N_rooms, D_max] with -100 padding
+            logits = np.asarray(logits)
+            labels = np.asarray(labels)
+            if logits.ndim != 3:
+                raise ValueError(f"Expected joint logits [N, D, C], got {logits.shape}")
+            n_items, d_max = logits.shape[0], logits.shape[1]
+
+            flat_logits = logits.reshape(-1, logits.shape[-1])
+            flat_labels = labels.reshape(-1)
+
+            meta = _room_desk_meta_from_recipes(eval_dataset, n_items, d_max)
+            keep = flat_labels != -100
+            if meta is not None:
+                keep = keep & np.array([m is not None for m in meta], dtype=bool)
+
+            y_true = flat_labels[keep].astype(int)
+            y_logits = flat_logits[keep]
+            predictions = np.argmax(y_logits, axis=-1)
+            probs = softmax(y_logits, axis=-1)
+
+            acc = accuracy_score(y_true, predictions)
+            f1 = f1_score(y_true, predictions, average='weighted')
+
+            if y_logits.shape[-1] == 2:
+                tn, fp, fn, tp = confusion_matrix(y_true, predictions, labels=[0, 1]).ravel()
+            else:
+                cm = confusion_matrix(y_true, predictions)
+                tp = np.diag(cm).sum()
+                fp = (cm.sum(axis=0) - np.diag(cm)).sum()
+                fn = (cm.sum(axis=1) - np.diag(cm)).sum()
+                tn = cm.sum() - (tp + fp + fn)
+
+            auc = float('nan')
+            best_acc, best_thresh = 0.0, 0.5
+            y_prob = None
+            if probs.shape[-1] == 2:
+                y_prob = probs[:, 1]
+                try:
+                    auc = roc_auc_score(y_true, y_prob)
+                    # a large gap between accuracy and best_accuracy means the ranking is fine
+                    # and only the decision threshold (i.e. the positive/negative prior the
+                    # model was trained on) is off
+                    fpr_curve, tpr_curve, thresholds = roc_curve(y_true, y_prob)
+                    accs = [accuracy_score(y_true, (y_prob >= t).astype(int)) for t in thresholds]
+                    best_idx = int(np.argmax(accs))
+                    best_acc, best_thresh = float(accs[best_idx]), float(thresholds[best_idx])
+                    if training_args.process_index == 0:
+                        print(f"Best Threshold: {best_thresh:.4f}, Best Accuracy: {best_acc:.4f}")
+                except ValueError as exc:
+                    print(f"Warning: Could not calculate AUC or Threshold: {exc}")
+
+            breakdown_metrics = {}
+            if meta is not None:
+                kept_meta = [m for m, k in zip(meta, keep) if k]
+                should_report = training_args.process_index == 0
+                breakdown_metrics.update(_emit_breakdown(
+                    title="Per-desk evaluation stats (joint)",
+                    key_name="desk",
+                    keys=[m["desk"] for m in kept_meta],
+                    labels=y_true, predictions=predictions, probs=y_prob,
+                    output_dir=output_dir, filename="desk_stats.txt",
+                    metric_prefix="desk_", should_report=should_report,
+                    wandb_table_key="per_desk_stats" if "wandb" in training_args.report_to else None,
+                ))
+                breakdown_metrics.update(_emit_breakdown(
+                    title="Evaluation stats by occupancy (k = other desks occupied)",
+                    key_name="occupancy",
+                    keys=[m["occupancy"] for m in kept_meta],
+                    labels=y_true, predictions=predictions, probs=y_prob,
+                    output_dir=output_dir, filename="occupancy_stats.txt",
+                    metric_prefix="occ_", should_report=should_report,
+                    wandb_table_key="occupancy_stats" if "wandb" in training_args.report_to else None,
+                ))
+
+            if "wandb" in training_args.report_to and wandb.run is not None:
+                try:
+                    wandb.log({"conf_mat": wandb.plot.confusion_matrix(
+                        probs=None, y_true=y_true, preds=predictions,
+                        class_names=["Empty", "Occupied"])})
+                except Exception as exc:
+                    print(f"Warning: failed to log W&B confusion matrix: {exc}", flush=True)
+
+            return {
+                "accuracy": acc,
+                "f1": f1,
+                "auc": auc,
+                "best_accuracy": best_acc,
+                "best_threshold": best_thresh,
+                "tp": float(tp),
+                "fp": float(fp),
+                "fn": float(fn),
+                "tn": float(tn),
+                "n_desk_decisions": float(len(y_true)),
+                **breakdown_metrics,
+            }
+
+        collate_fn = RoomWindowCollate(context_length=context_length)
+
+        trainer = Trainer(
+            model=model,
+            args=training_args,
+            train_dataset=train_dataset,
+            eval_dataset=eval_dataset,
+            callbacks=callbacks,
+            data_collator=collate_fn,
+            compute_metrics=compute_metrics,
+        )
+
+        if remove_printer_callback:
+            trainer.pop_callback(PrinterCallback)
+
+        trainer.train()
+
+        model.chronos_config.context_length = max(model.chronos_config.context_length, context_length)
+        model.config.chronos_config = model.chronos_config.__dict__
+
+        finetuned_pipeline = Chronos2Pipeline(model=model)
+
+        if training_kwargs["tf32"]:
+            torch.backends.cuda.matmul.allow_tf32 = matmul_tf32
+            torch.backends.cudnn.allow_tf32 = cudnn_tf32
+
+        return finetuned_pipeline
+
     def fit_classifier_multi_desk(
         self,
         train_inputs: List[str],
@@ -1389,6 +2192,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
         model_update_kwargs: dict = None,
         linear_probe: bool = False,
         gradient_accumulation_steps: int = 1,
+        # Seeds the Trainer itself (batch order + augmentation),
+        # not just the model init the caller already seeded.
+        seed: int = 42,
         **extra_trainer_kwargs,
     ) -> "Chronos2Pipeline":
         import torch.cuda
@@ -1479,12 +2285,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
         dataset_kwargs = dataset_kwargs or {}
         # extract 'root' from dataset_kwargs if it exists, else use the hardcoded path.
         dataset_root = dataset_kwargs.pop('root', '/home/shanmu/projects/DeskPulse/tdma_sensing/cir_files/processed_cir')
+        dataset_n_channels = _infer_dataset_n_channels(n_channels, dataset_kwargs)
 
         train_manifest = DataManifest(dataset_root, layouts=train_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
         # Using dataset_params (DictConfig) directly
         train_dataset = MultiDeskDataset(
             train_manifest,
-            n_channels=4, 
+            n_channels=dataset_n_channels, 
             synthesis_mode=True, # in the training mode 
             aug_layout_training=dataset_kwargs.get("train_augment_layout", True),
             max_recipes=dataset_kwargs.get("train_max_recipe", 20000), 
@@ -1561,6 +2368,13 @@ class Chronos2Pipeline(BaseChronosPipeline):
             disable_tqdm=False,
             report_to="wandb",
             run_name='chronos2-lo_5',
+            # Without this TrainingArguments.seed defaults to 42 and
+            # Trainer.__init__ calls set_seed(42) AFTER the model is built, so
+            # the caller's set_seed(training.seed) survived only in the freshly
+            # initialised head -- batch order and every augmentation draw were
+            # identical for every "seed". Passing it here makes the seed govern
+            # the whole run.
+            seed=seed,
             max_steps=num_steps,
             gradient_accumulation_steps=gradient_accumulation_steps,
             dataloader_num_workers=0,
@@ -1585,7 +2399,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
             test_manifest = DataManifest(dataset_root, layouts=validation_inputs, lpf_cutoff=dataset_kwargs.get("lpf_cutoff"))
             eval_dataset = MultiDeskDataset(
                 test_manifest, 
-                n_channels=4, 
+                n_channels=dataset_n_channels, 
                 synthesis_mode=False, 
                 aug_layout_testing=eval_layout_augmentation,
                 min_max_normalization=False,
@@ -1792,9 +2606,12 @@ class Chronos2Pipeline(BaseChronosPipeline):
                  print(f"Warning: Could not calculate AUC or Threshold: {e}")
 
             if "wandb" in training_args.report_to:
-                wandb.log({"conf_mat": wandb.plot.confusion_matrix(probs=None,
-                                y_true=labels_valid, preds=predictions_valid,
-                                class_names=["Empty", "Occupied"])})
+                try:
+                    wandb.log({"conf_mat": wandb.plot.confusion_matrix(probs=None,
+                                    y_true=labels_valid, preds=predictions_valid,
+                                    class_names=["Empty", "Occupied"])})
+                except Exception as exc:
+                    print(f"Warning: failed to log W&B confusion matrix: {exc}", flush=True)
 
             return {
                 "accuracy": acc,
@@ -1819,15 +2636,29 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 
                 # Use standard Dataloader with our custom sampler
                 # Note: shuffle must be False when sampler is used
-                return DataLoader(
-                    self.train_dataset,
+                # torch's _worker_loop already reseeds numpy per worker
+                # (np.random.seed(_generate_state(base_seed, worker_id))), so
+                # augmentation streams are independent either way. seed_worker
+                # is added for parity with Trainer._get_dataloader, which sets
+                # it on every training loader; it also carries persistent_workers
+                # and prefetch_factor, which this hand-built loader dropped.
+                params = dict(
                     batch_size=self.args.train_batch_size,
-                    sampler=sampler, 
+                    sampler=sampler,
                     collate_fn=self.data_collator,
                     drop_last=self.args.dataloader_drop_last,
                     num_workers=self.args.dataloader_num_workers,
                     pin_memory=self.args.dataloader_pin_memory,
+                    worker_init_fn=partial(
+                        seed_worker,
+                        num_workers=self.args.dataloader_num_workers,
+                        rank=self.args.process_index,
+                    ),
                 )
+                if self.args.dataloader_num_workers > 0:
+                    params["persistent_workers"] = self.args.dataloader_persistent_workers
+                    params["prefetch_factor"] = self.args.dataloader_prefetch_factor
+                return DataLoader(self.train_dataset, **params)
 
         TrainerClass = WeightedTrainer if train_weighted_sampler else Trainer
 
