@@ -14,6 +14,12 @@ from itertools import combinations
 import warnings as Warnings
 import itertools
 from typing import List, Tuple, Dict, Optional
+from chronos.chronos2.geometry_embedding import (
+    estimated_tap_dict,
+    generate_geometry_feature_lookup,
+    node_coordinate_dict,
+    query_geometry_feature_lookup,
+)
 
 import numpy as np
 import torch
@@ -26,6 +32,7 @@ if TYPE_CHECKING:
 
 
 TensorOrArray: TypeAlias = torch.Tensor | np.ndarray
+
 
 
 def left_pad_and_cat_2D(tensors: list[torch.Tensor]) -> torch.Tensor:
@@ -668,41 +675,38 @@ class ChronosClassificationCollate:
         self.context_length = context_length
         self.deployment_dict = deployment_dict or {}
         self.deployment_dict = {
-            "deployment4": {
-                '1': [13, 35, 28, 17],
-                '2': [13, 21, 27, 32],
-                '3': [24, 33, 15, 17],
-                '4': [25, 20, 15, 32]
-            },
-            "deployment5": {
-                '1': [26, 33, 15, 20],
-                '2': [14, 34, 27, 19],
-                '3': [25, 19, 15, 32],
-                '4': [12, 20, 28, 32]
-            },
-            "deployment7": {
-                '1': [20, 26, 43, 12], # 
-                '2': [19, 13, 43, 23], #
-                '3': [33, 24, 28, 12], # 
-                '4': [32, 12, 29, 23], #
-                '5': [48, 25, 16, 14], # 
-                '6': [48, 13, 15, 24], #
-            },
-            "deployment8": {
-                '1': [14, 31, 45, 20], 
-                '2': [14, 21, 45, 30], #
-                '3': [25, 29, 29, 17], #
-                '4': [24, 18, 29, 27], # 
-                '5': [40, 29, 16, 19], # 
-                '6': [40, 19, 16, 29], # 
-            },
-            "deployment9": {
-                '1': [13, 36, 27, 20], '2': [13, 22, 26, 32], '3': [25, 36, 14, 19], '4': [24, 21, 14, 32]
-            },
-            "deployment10": {
-                '1': [25, 35, 14, 19], '2': [13, 34, 26, 20], '3': [24, 20, 14, 32], '4': [12, 21, 28, 33]
-            },
-        }
+        "deployment7": {
+            '1': [20, 25, 42, 12], #
+            '2': [20, 13, 41, 22], #
+            '3': [33, 25, 28, 11], #
+            '4': [31, 12, 28, 22], #
+            '5': [49, 25, 16, 14], # 
+            '6': [48, 13, 16, 25], #
+        },
+        "deployment8": {
+            '1': [13, 30, 44, 20], 
+            '2': [13, 20, 43, 29], #
+            '3': [24, 29, 28, 16], #
+            '4': [23, 18, 29, 27], # 
+            '5': [39, 30, 16, 18], # 
+            '6': [40, 19, 15, 29], # 
+        },
+        "deployment9": {
+            '1': [12, 37, 27, 19],
+            '2': [12, 22, 26, 32],
+            '3': [25, 36, 14, 19],
+            '4': [24, 21, 14, 33]
+        },
+        "deployment10": {
+            '1': [23, 33, 14, 21],
+            '2': [12, 34, 27, 21],
+            '3': [24, 20, 14, 32],
+            '4': [12, 20, 28, 35]
+        }}
+        self.feature_lookup = generate_geometry_feature_lookup(
+            node_coordinates_by_layout=node_coordinate_dict,
+            deployment_dict=self.deployment_dict,
+        )
         
         self.deployment_min_max = {}
         for layout_name, layout_dict in self.deployment_dict.items():
@@ -738,6 +742,7 @@ class ChronosClassificationCollate:
         group_ids = torch.arange(B).repeat_interleave(N)
 
         batch_bin_centers = []
+        batch_geometry_features = []
         for meta in metas:
             layout = meta.get('layout')
             slice_idx = meta.get('slice') + 1
@@ -753,12 +758,27 @@ class ChronosClassificationCollate:
                 print('No bin centers found!')
                 base_centers = np.zeros(4, dtype=int)
                 
+            geo_features = query_geometry_feature_lookup(
+                feature_lookup=self.feature_lookup,
+                layout=layout,
+                desk_id=slice_idx,
+            ) # geo_features: [4, 5] - 4 links, 5 features each
+            # The lookup hands back its cached array, so copy before permuting --
+            # an in-place swap here would corrupt the entry for every later sample.
+            geo_features = np.array(geo_features, copy=True)
+
+            # `_finalize_signal` applies the mirror swap and then the layout roll to
+            # the LINK axis of the signal. bin_centers and raw_geometry are indexed by
+            # that same link axis, so all three must receive the identical permutation
+            # or the model is told the wrong link identity for a transformed sample.
             if is_mirrored and len(base_centers) > 3:
                 base_centers[[1, 3]] = base_centers[[3, 1]]
-                
+                geo_features[[1, 3]] = geo_features[[3, 1]]
+
             if shift > 0:
                 base_centers = np.roll(base_centers, shift)
-                
+                geo_features = np.roll(geo_features, shift, axis=0)
+
             final_centers = base_centers + offsets
             
             # if layout in self.deployment_min_max:
@@ -766,11 +786,15 @@ class ChronosClassificationCollate:
             #     final_centers = (final_centers - deploy_min) / (deploy_max - deploy_min)
                     
             batch_bin_centers.append(final_centers)
-            
+            batch_geometry_features.append(geo_features)
+
         # Convert to tensor and flatten to match Group IDs
         if batch_bin_centers: # list len: B, element: (4,)
+            geo_raw_feature = torch.tensor(np.array(batch_geometry_features), dtype=torch.float32) # [B, 4, 5]
+            geo_raw_feature = geo_raw_feature.view(-1, 5) # [B*4, 5]
+            geo_raw_feature = geo_raw_feature.repeat_interleave(N//4, dim=0)
             bin_centers_tensor = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32) # [B, 4] - need to duplicate twice (I/Q)
-            bin_centers_tensor = bin_centers_tensor.view(-1) # [B*N], N is 8
+            bin_centers_tensor = bin_centers_tensor.view(-1) # [B*4]
             bin_centers_tensor = bin_centers_tensor.repeat_interleave(N//4)
         else:
             bin_centers_tensor = torch.empty(0, dtype=torch.float32)
@@ -781,6 +805,7 @@ class ChronosClassificationCollate:
             "group_ids": group_ids,    # [B*N]
             "labels": labels,           # [B]
             "bin_centers": bin_centers_tensor, # [B*N]
+            "raw_geometry": geo_raw_feature, # [B*N, 5]
         }
 
 class ChronosSupConCollate:
@@ -1355,15 +1380,18 @@ class SyntheticSignalDataset(Dataset):
         else:
             offsets = np.zeros(synthesized_signal.shape[0], dtype=int)
             
-        gated_channels = []
+        gated_channels = np.zeros((synthesized_signal.shape[0], synthesized_signal.shape[1], self.range_gating_width), dtype=synthesized_signal.dtype)
         for c in range(synthesized_signal.shape[0]):
             c_idx = center_idx + offsets[c]
             start = max(0, c_idx - half_width)
             end = min(synthesized_signal.shape[-1], c_idx + half_width + 1)
-            gated_channels.append(synthesized_signal[c, :, start:end])
-            
-        means = [np.mean(ch, axis=-1) for ch in gated_channels]
-        synthesized_signal = np.stack(means, axis=0)
+            gated_channels[c] = synthesized_signal[c, :, start:end]
+
+        # means = [np.mean(ch, axis=-1) for ch in gated_channels]
+        # synthesized_signal = np.stack(means, axis=0)
+        
+        synthesized_signal = np.mean(gated_channels, axis=-1)  # Shape: [C, T]
+        # synthesized_signal = np.reshape(gated_channels, (synthesized_signal.shape[0] * self.range_gating_width, synthesized_signal.shape[1]))    
 
         if self.min_max_normalization:
             synthesized_signal = self.min_max_norm(synthesized_signal)
@@ -1854,6 +1882,487 @@ class MultiDeskDataset(Dataset):
         }
             
         return tensor_sig, label_tensor, idx, meta_info
+
+# ============================================================================
+# Joint (whole-room) occupancy classification
+# ============================================================================
+
+RoomRecipe = Tuple[List[Tuple[str, int]], int, str, str, bool]
+
+
+class RoomWindowDataset(Dataset):
+    """
+    Whole-room windows for joint all-desk-at-once occupancy classification.
+
+    Each item is one time window of one room: signal [D, C, T] plus a length-D label
+    vector. D is the room's real desk count (4 or 6) and is NOT padded here, so a batch
+    may mix rooms with different desk counts -- downstream, all D*C variates of an item
+    share a single group id, which is what lets desks attend to each other inside the
+    encoder while staying invariant to how many desks the room has.
+
+    Training recipes mix whole rooms: two recordings whose occupancy bits do not overlap
+    are summed and the label becomes the OR of their bits. This is the room-level
+    generalization of the per-desk ghost augmentation, and it is the only augmentation
+    that manufactures new multi-occupancy combinations -- the regime where nearly all of
+    the per-desk model's errors live.
+
+    `desk` selects which desks are *supervised*, not which are fed in: an unsupervised
+    desk still contributes its signal to the group (that context is exactly the point)
+    but gets label -100 so it is dropped from the loss and from the metrics. That keeps
+    leave-one-desk-out protocols meaningful under joint input.
+    """
+
+    def __init__(self,
+                 manifest: DataManifest,
+                 n_channels: int = 4,
+                 window_size: int = 512,
+                 stride: int = 256,
+                 max_recipes: int = None,
+                 stack_complex: bool = True,
+                 synthesis_mode: bool = True,
+                 aug_layout_training: bool = False,
+                 aug_layout_testing: bool = False,
+                 augment_phase: bool = False,
+                 augment_phase_step: int = 60,
+                 augment_time_warp: bool = False,
+                 time_warp_num_knots: int = 6,
+                 time_warp_strength: float = 15.0,
+                 blending_alpha_enabled: bool = True,
+                 blending_alpha_range: Tuple[float, float] = (0.1, 1.1),
+                 min_max_normalization: bool = False,
+                 convert_complex_to_float: str = "I_Q",
+                 range_gating_width: int = 5,
+                 augment_range_gating_offset: bool = False,
+                 desk: Optional[List[List[int]]] = None,
+                 random_starting_index: bool = False,
+                 mirroring_room: bool = False,
+                 gaussian_noise: bool = False,
+                 room_blend: bool = True,
+                 room_blend_per_recipe: int = 1,
+                 room_blend_occupied_alpha_range: Tuple[float, float] = (0.8, 1.2),
+                 room_blend_seed: int = 42):
+        """
+        Args mirror SyntheticSignalDataset. Joint-specific ones:
+            room_blend:
+                If True (train only), add recipes that sum two whole-room recordings with
+                disjoint occupancy bits, labelled with the OR of their bits.
+            room_blend_per_recipe:
+                How many blended partners to draw per base recipe.
+            desk:
+                Per-layout list of 1-indexed desks to supervise ([] = all). Unsupervised
+                desks are still fed to the model but labelled -100.
+        """
+        self.n_channels = n_channels
+        self.window_size = window_size
+        self.stride = stride
+        self.stack_complex = stack_complex
+        self.synthesis_mode = synthesis_mode
+        self.aug_layout_training = aug_layout_training
+        self.aug_layout_testing = aug_layout_testing
+        self.augment_phase = augment_phase
+        self.augment_phase_step = augment_phase_step
+        self.augment_time_warp = augment_time_warp
+        self.time_warp_num_knots = time_warp_num_knots
+        self.time_warp_strength = time_warp_strength
+        self.blending_alpha_enabled = blending_alpha_enabled
+        self.blending_alpha_range = blending_alpha_range
+        self.min_max_normalization = min_max_normalization
+        self.convert_complex_to_float = convert_complex_to_float
+        self.range_gating_width = range_gating_width
+        self.augment_range_gating_offset = augment_range_gating_offset
+        self.manifest = manifest
+        self.desk = desk
+        self.random_starting_index = random_starting_index
+        self.mirroring_room = mirroring_room
+        self.gaussian_noise = gaussian_noise
+        self.room_blend = room_blend
+        self.room_blend_per_recipe = room_blend_per_recipe
+        self.room_blend_occupied_alpha_range = tuple(room_blend_occupied_alpha_range)
+        self.room_blend_seed = room_blend_seed
+
+        self.recipes: List[RoomRecipe] = []
+
+        if synthesis_mode:
+            self._build_training_recipes(manifest, max_recipes)
+        else:
+            self._build_testing_recipes(manifest)
+
+        print(f"RoomWindowDataset initialized in mode={'TRAIN/SYNTH' if synthesis_mode else 'TEST/LINEAR'}")
+        print(f"Total Samples (room-windows): {len(self.recipes)}")
+        self._print_statistics()
+
+    # ------------------------------------------------------------------ recipes
+
+    def _get_file_segments(self, fpath: str) -> List[Tuple[str, int]]:
+        shape = self.manifest.get_file_shape(fpath)
+        if len(shape) < 4:
+            return []
+        t_dim = shape[2]
+        if t_dim < self.window_size:
+            return []
+        if self.random_starting_index:
+            return [(fpath, -1)]
+        max_start = t_dim - self.window_size
+        return [(fpath, idx) for idx in range(0, max_start + 1, self.stride)]
+
+    def supervised_desks(self, layout: str) -> Optional[List[int]]:
+        """1-indexed desks to supervise for a layout, or None for 'all'."""
+        if self.desk is None:
+            return None
+        layouts = self.manifest.get_layouts()
+        if layout not in layouts:
+            return None
+        layout_idx = layouts.index(layout)
+        if layout_idx >= len(self.desk):
+            return None
+        selected = self.desk[layout_idx]
+        return None if len(selected) == 0 else list(selected)
+
+    def _shift_mirror_grid(self, is_training: bool):
+        aug_layout = self.aug_layout_training if is_training else self.aug_layout_testing
+        shifts = range(self.n_channels) if aug_layout else [0]
+        mirrors = [False, True] if self.mirroring_room else [False]
+        return shifts, mirrors
+
+    def _build_testing_recipes(self, manifest: DataManifest):
+        shifts, mirrors = self._shift_mirror_grid(is_training=False)
+        for layout in manifest.get_layouts():
+            for lbl in manifest.layout_buckets[layout].keys():
+                for fpath in manifest.get_files(layout, lbl):
+                    for seg in self._get_file_segments(fpath):
+                        for shift in shifts:
+                            for is_mirrored in mirrors:
+                                self.recipes.append(
+                                    ([(seg[0], seg[1], lbl)], shift, lbl, layout, is_mirrored)
+                                )
+
+    def _build_training_recipes(self, manifest: DataManifest, max_recipes: int):
+        rng = np.random.default_rng(self.room_blend_seed)
+        shifts, mirrors = self._shift_mirror_grid(is_training=True)
+
+        for layout in manifest.get_layouts():
+            # all (segment, bits) for this room
+            segments_by_bits: Dict[str, List[Tuple[str, int]]] = {}
+            for lbl in manifest.layout_buckets[layout].keys():
+                for fpath in manifest.get_files(layout, lbl):
+                    segs = self._get_file_segments(fpath)
+                    if segs:
+                        segments_by_bits.setdefault(lbl, []).extend(segs)
+
+            if not segments_by_bits:
+                continue
+
+            # For each occupancy pattern, which segments can be summed with it without
+            # two people landing on the same desk. Empty-room recordings are compatible
+            # with everything, which recovers the old ghost/clutter augmentation.
+            all_bits = list(segments_by_bits.keys())
+            compatible: Dict[str, List[Tuple[str, int, str]]] = {}
+            for bits in all_bits:
+                mask = int(bits, 2)
+                pool = []
+                for other in all_bits:
+                    if mask & int(other, 2) == 0:
+                        pool.extend((f, s, other) for (f, s) in segments_by_bits[other])
+                compatible[bits] = pool
+
+            for bits, segs in segments_by_bits.items():
+                for (fpath, start) in segs:
+                    ingredient = (fpath, start, bits)
+                    for shift in shifts:
+                        for is_mirrored in mirrors:
+                            self.recipes.append(([ingredient], shift, bits, layout, is_mirrored))
+
+                            if not (self.room_blend and compatible[bits]):
+                                continue
+                            for _ in range(self.room_blend_per_recipe):
+                                pool = compatible[bits]
+                                partner = pool[rng.integers(len(pool))]
+                                if (partner[0], partner[1]) == (fpath, start):
+                                    continue
+                                merged = self._or_bits(bits, partner[2])
+                                self.recipes.append(
+                                    ([ingredient, partner], shift, merged, layout, is_mirrored)
+                                )
+
+        if max_recipes and len(self.recipes) > max_recipes:
+            rng.shuffle(self.recipes)
+            self.recipes = self.recipes[:max_recipes]
+
+    @staticmethod
+    def _or_bits(a: str, b: str) -> str:
+        return ''.join('1' if (x == '1' or y == '1') else '0' for x, y in zip(a, b))
+
+    def _blend_alpha_for(self, piece_bits: str) -> float:
+        """
+        Amplitude for a blended-in recording.
+
+        An EMPTY partner is pure clutter, so attenuating it is exactly the old per-desk ghost
+        augmentation and it keeps the configured (small) `blending_alpha_range`.
+
+        A partner that CARRIES OCCUPANTS must be summed at ~full amplitude. Scaling a person
+        down to a fraction of their amplitude while still labelling that desk "occupied"
+        manufactures label noise: it teaches the model that a few percent of a person's signal
+        counts as occupied, which shows up directly as a high false-positive rate.
+        """
+        if '1' in piece_bits:
+            low, high = self.room_blend_occupied_alpha_range
+        elif self.blending_alpha_enabled:
+            low, high = self.blending_alpha_range
+        else:
+            return 1.0
+        return float(np.random.uniform(low, high))
+
+    def _print_statistics(self):
+        pos = neg = held_out = 0
+        for _, _, label_bits, layout, _ in self.recipes:
+            supervised = self.supervised_desks(layout)
+            for d, bit in enumerate(label_bits):
+                if supervised is not None and (d + 1) not in supervised:
+                    held_out += 1
+                    continue
+                pos += (bit == '1')
+                neg += (bit == '0')
+        total = pos + neg
+        print("\n" + "=" * 34)
+        print(f" RoomWindowDataset ({'TRAIN' if self.synthesis_mode else 'TEST'})")
+        print("=" * 34)
+        print(f" Room windows   : {len(self.recipes)}")
+        print(f" Desk decisions : {total}" + (f" (+{held_out} unsupervised)" if held_out else ""))
+        if total:
+            print(f" Label 0 (Neg)  : {neg} ({neg / total:.1%})")
+            print(f" Label 1 (Pos)  : {pos} ({pos / total:.1%})")
+        n_blended = sum(1 for r in self.recipes if len(r[0]) > 1)
+        if n_blended:
+            occupied_partner = sum(1 for r in self.recipes if len(r[0]) > 1 and '1' in r[0][1][2])
+            print(f" Room-blended   : {n_blended} ({n_blended / len(self.recipes):.1%})")
+            print(f"   partner w/ occupants : {occupied_partner} "
+                  f"(alpha {self.room_blend_occupied_alpha_range})")
+            print(f"   partner empty/clutter: {n_blended - occupied_partner} "
+                  f"(alpha {self.blending_alpha_range if self.blending_alpha_enabled else 1.0})")
+        print("=" * 34 + "\n")
+
+    # ------------------------------------------------------------------ signal
+
+    def _apply_time_warp(self, signal: np.ndarray, strength: float = 15.0) -> np.ndarray:
+        """Same warp for every desk/link/bin so the room stays physically consistent."""
+        D, C, T, B = signal.shape
+        flat = signal.reshape(D * C, T, B)
+
+        orig_knots = np.linspace(0, T - 1, self.time_warp_num_knots)
+        offsets = np.random.normal(0, strength, self.time_warp_num_knots)
+        offsets[0] = 0
+        offsets[-1] = 0
+
+        x_grid = np.arange(T)
+        sample_indices = np.clip(x_grid + np.interp(x_grid, orig_knots, offsets), 0, T - 1)
+
+        warped = np.zeros_like(flat)
+        for dc in range(D * C):
+            for b in range(B):
+                if np.iscomplexobj(flat):
+                    real = np.interp(sample_indices, x_grid, flat[dc, :, b].real)
+                    imag = np.interp(sample_indices, x_grid, flat[dc, :, b].imag)
+                    warped[dc, :, b] = real + 1j * imag
+                else:
+                    warped[dc, :, b] = np.interp(sample_indices, x_grid, flat[dc, :, b])
+        return warped.reshape(D, C, T, B)
+
+    def min_max_norm(self, signal: np.ndarray) -> np.ndarray:
+        r = np.abs(signal)
+        r_min, r_max = np.min(r), np.max(r)
+        return ((r - r_min) / (r_max - r_min + 1e-12)) * np.exp(1j * np.angle(signal))
+
+    def _finalize_signal(self, signal: np.ndarray, shift: int, is_mirrored: bool):
+        """
+        [D, C, T, B] -> [D, C_out, T]. Shift/mirror act on the link axis and are applied
+        identically to every desk, so the room is transformed as a rigid whole.
+        """
+        if is_mirrored and signal.shape[1] > 3:
+            signal[:, [1, 3]] = signal[:, [3, 1]]
+
+        if shift > 0:
+            signal = np.roll(signal, shift, axis=1)
+
+        D, C = signal.shape[0], signal.shape[1]
+        center_idx = signal.shape[-1] // 2
+        half_width = self.range_gating_width // 2
+
+        if self.augment_range_gating_offset:
+            offsets = np.random.randint(-1, 2, size=(D, C))
+        else:
+            offsets = np.zeros((D, C), dtype=int)
+
+        gated = np.zeros((D, C, signal.shape[2], self.range_gating_width), dtype=signal.dtype)
+        for d in range(D):
+            for c in range(C):
+                c_idx = center_idx + offsets[d, c]
+                start = max(0, c_idx - half_width)
+                end = min(signal.shape[-1], c_idx + half_width + 1)
+                gated[d, c, :, :end - start] = signal[d, c, :, start:end]
+
+        signal = np.mean(gated, axis=-1)  # [D, C, T]
+
+        if self.min_max_normalization:
+            signal = self.min_max_norm(signal)
+
+        if self.stack_complex:
+            if self.convert_complex_to_float == "mag_phase":
+                a = torch.from_numpy(np.abs(signal))
+                b = torch.from_numpy(np.angle(signal))
+            else:
+                a = torch.from_numpy(signal.real)
+                b = torch.from_numpy(signal.imag)
+            # interleave per link -> link0_a, link0_b, link1_a, ... (matches geometry order)
+            tensor_sig = torch.stack([a, b], dim=2).reshape(D, -1, a.shape[-1])
+        else:
+            tensor_sig = torch.from_numpy(signal)
+
+        return tensor_sig.to(torch.float32), offsets
+
+    # ------------------------------------------------------------------ access
+
+    def __len__(self):
+        return len(self.recipes)
+
+    def __getitem__(self, idx):
+        ingredients, shift, label_bits, layout, is_mirrored = self.recipes[idx]
+
+        synthesized = None
+        for (fpath, start_idx, piece_bits) in ingredients:
+            raw = np.load(fpath, mmap_mode='r')
+            if start_idx == -1:
+                start_idx = np.random.randint(0, max(1, raw.shape[2] - self.window_size - 100))
+            piece = raw[:, :, start_idx:start_idx + self.window_size, :].copy()
+
+            if self.augment_phase:
+                # one global phasor per recording: a CFO-like rotation is common to the room
+                k = np.random.randint(0, self.augment_phase_step)
+                theta = k * (2 * np.pi / self.augment_phase_step)
+                piece = (piece * np.exp(1j * theta)).astype(np.complex64)
+
+            if self.augment_time_warp:
+                piece = self._apply_time_warp(piece, strength=self.time_warp_strength)
+
+            if synthesized is None:
+                synthesized = piece
+            else:
+                synthesized += self._blend_alpha_for(piece_bits) * piece
+
+        if self.gaussian_noise:
+            sigma = 0.05
+            noise = np.random.normal(0, sigma, synthesized.shape)
+            if np.iscomplexobj(synthesized):
+                noise = noise + 1j * np.random.normal(0, sigma, synthesized.shape)
+            synthesized = (synthesized + noise).astype(synthesized.dtype)
+
+        tensor_sig, offsets = self._finalize_signal(synthesized, shift, is_mirrored)
+        D = tensor_sig.shape[0]
+
+        supervised = self.supervised_desks(layout)
+        labels = []
+        for d in range(D):
+            if supervised is not None and (d + 1) not in supervised:
+                labels.append(-100.0)          # fed to the model, excluded from loss/metrics
+            else:
+                labels.append(1.0 if label_bits[d] == '1' else 0.0)
+        label_tensor = torch.tensor(labels, dtype=torch.float32)
+
+        meta_info = {
+            "layout": layout if layout is not None else "unknown",
+            "num_desks": D,
+            "label_bits": label_bits,
+            "shift": shift,
+            "offsets": offsets,
+            "is_mirrored": is_mirrored,
+        }
+        return tensor_sig, label_tensor, idx, meta_info
+
+
+class RoomWindowCollate:
+    """
+    Collate for RoomWindowDataset.
+
+    The important line is `group_ids`: every variate of one room-window gets the SAME id,
+    so Chronos' group attention (a hard partition, see
+    Chronos2Encoder._construct_and_invert_group_time_mask) mixes all desks of a room from
+    the first encoder layer while keeping different rooms in the batch fully separate.
+    Because that mask is built from ids rather than shapes, groups may differ in size and
+    a batch can mix 4-desk and 6-desk rooms with no padding anywhere in the encoder.
+
+    Padding appears only in `labels` (-100 up to D_max), purely so the Trainer sees a
+    rectangular per-item tensor; `desk_counts` says how many of those rows are real.
+    """
+
+    def __init__(self, context_length: int, deployment_dict: Optional[Dict] = None):
+        self.context_length = context_length
+        self.deployment_dict = deployment_dict or estimated_tap_dict
+        self.feature_lookup = generate_geometry_feature_lookup(
+            node_coordinates_by_layout=node_coordinate_dict,
+            deployment_dict=self.deployment_dict,
+        )
+        self._missing_geometry_warned = set()
+
+    def _geometry_for(self, layout: str, desk_id: int, n_links: int,
+                      shift: int, is_mirrored: bool) -> np.ndarray:
+        """[n_links, 5] geometry features, transformed to match the signal's links."""
+        try:
+            geo = query_geometry_feature_lookup(
+                feature_lookup=self.feature_lookup, layout=layout, desk_id=desk_id
+            )
+        except (KeyError, TypeError):
+            if (layout, desk_id) not in self._missing_geometry_warned:
+                self._missing_geometry_warned.add((layout, desk_id))
+                print(f"Warning: no geometry for {layout} desk {desk_id}; using zeros.")
+            return np.zeros((n_links, 5), dtype=float)
+
+        geo = np.asarray(geo, dtype=float)
+        # keep geometry aligned with the same link permutation applied to the signal
+        if is_mirrored and geo.shape[0] > 3:
+            geo[[1, 3]] = geo[[3, 1]]
+        if shift > 0:
+            geo = np.roll(geo, shift, axis=0)
+        return geo
+
+    def __call__(self, batch):
+        contexts, group_ids, geometry, label_rows, desk_counts = [], [], [], [], []
+
+        for b, item in enumerate(batch):
+            sig, labels, _, meta = item[0], item[1], item[2], item[-1]
+            if sig.shape[-1] > self.context_length:
+                sig = sig[:, :, -self.context_length:]
+
+            D, C, T = sig.shape
+            contexts.append(sig.reshape(D * C, T))
+            group_ids.append(torch.full((D * C,), b, dtype=torch.long))
+            label_rows.append(labels)
+            desk_counts.append(D)
+
+            n_links = max(1, C // 2)          # C = n_links * 2 after I/Q stacking
+            reps = C // n_links
+            for d in range(D):
+                geo = self._geometry_for(
+                    meta.get("layout", "unknown"), d + 1, n_links,
+                    int(meta.get("shift", 0)), bool(meta.get("is_mirrored", False)),
+                )
+                geo = torch.from_numpy(geo).to(torch.float32)
+                geometry.append(geo.repeat_interleave(reps, dim=0))   # [C, 5]
+
+        context = torch.cat(contexts, dim=0).to(torch.float32)        # [sum_b D_b*C, T]
+        group_ids = torch.cat(group_ids, dim=0)                       # [sum_b D_b*C]
+        raw_geometry = torch.cat(geometry, dim=0)                     # [sum_b D_b*C, 5]
+
+        d_max = max(desk_counts)
+        labels = torch.full((len(batch), d_max), -100.0, dtype=torch.float32)
+        for b, row in enumerate(label_rows):
+            labels[b, :row.shape[0]] = row
+
+        return {
+            "context": context,
+            "group_ids": group_ids,
+            "raw_geometry": raw_geometry,
+            "labels": labels,                                          # [B, D_max], -100 = ignore
+            "desk_counts": torch.tensor(desk_counts, dtype=torch.long),  # [B]
+        }
 
 if __name__ == '__main__':
     print("--- Running Data Integrity Validation ---")

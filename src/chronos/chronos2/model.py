@@ -794,6 +794,110 @@ class Chronos2Model(PreTrainedModel):
             enc_group_self_attn_weights=encoder_outputs.all_group_self_attn_weights,
         )
 
+class GeometryEncoder(nn.Module):
+    def __init__(
+        self,
+        model_dim,
+        num_frequencies=6,
+    ):
+        super().__init__()
+
+        self.num_frequencies = num_frequencies
+
+        # 5 raw normalized features
+        # + 5 * K * 2 Fourier features
+        input_dim = 5 + 5 * num_frequencies * 2
+
+        self.projector = nn.Sequential(
+            nn.Linear(input_dim, model_dim // 2),
+            nn.SiLU(),
+            # nn.LayerNorm(model_dim // 2),
+            nn.Linear(model_dim // 2, model_dim),
+        )
+
+        # Preserve pretrained behavior initially
+        nn.init.xavier_uniform_(self.projector[0].weight)
+        nn.init.zeros_(self.projector[0].bias)
+
+        nn.init.zeros_(self.projector[-1].weight)
+        nn.init.zeros_(self.projector[-1].bias)
+
+    def forward(self, raw_geometry):
+        """
+        raw_geometry: [B, 5]
+
+        feature order:
+            0 baseline_m
+            1 excess_path_m
+            2 cos_beta
+            3 d_parallel_m
+            4 d_perp_m
+        """
+
+        g = raw_geometry.float()
+
+        # Normalize geometry BEFORE Fourier encoding
+        g = self.normalize(g)
+
+        # frequencies: [K]
+        freq = torch.pow(
+            2.0,
+            torch.arange(
+                self.num_frequencies,
+                device=g.device,
+                dtype=g.dtype,
+            )
+        )
+
+        # [B, 5, K]
+        angles = torch.pi * g.unsqueeze(-1) * freq
+
+        # [B, 5, K, 2]
+        ff = torch.stack(
+            [
+                torch.sin(angles),
+                torch.cos(angles),
+            ],
+            dim=-1,
+        )
+
+        # [B, 5 * K * 2]
+        ff = ff.flatten(start_dim=1)
+
+        # Preserve low-frequency / monotonic information
+        features = torch.cat(
+            [g, ff],
+            dim=-1,
+        )
+
+        return self.projector(features)
+
+    def normalize(self, g):
+        baseline = g[:, 0]
+        excess   = g[:, 1]
+        cos_beta = g[:, 2]
+        d_para   = g[:, 3]
+        d_perp   = g[:, 4]
+
+        baseline = baseline / 8
+        excess   = excess   / 8
+        d_para   = d_para   / 8
+        d_perp   = d_perp   / 8
+
+        # Already [-1, 1]
+        cos_beta = cos_beta
+
+        return torch.stack(
+            [
+                baseline,
+                excess,
+                cos_beta,
+                d_para,
+                d_perp,
+            ],
+            dim=-1,
+        )
+
 class Chronos2ModelClassification(Chronos2Model):
     def __init__(self, config, **kwargs):
         super().__init__(config)
@@ -837,6 +941,11 @@ class Chronos2ModelClassification(Chronos2Model):
             nn.Linear(512, 128)
         )
 
+        self.geometry_encoder = GeometryEncoder(
+            model_dim=self.model_dim,
+            num_frequencies=config.chronos_config["num_frequencies"], # choose from 2, 4, 6
+        )
+
         self.geometry_projector = nn.Sequential(
             nn.Linear(20, self.model_dim // 2),
             nn.ReLU(),
@@ -871,6 +980,7 @@ class Chronos2ModelClassification(Chronos2Model):
         future_target_mask: torch.Tensor | None = None,
         output_attentions: bool = False,
         bin_centers: torch.Tensor | None = None,
+        raw_geometry: torch.Tensor | None = None
     ):
         self._validate_input(
             context=context,
@@ -892,25 +1002,31 @@ class Chronos2ModelClassification(Chronos2Model):
         # get input embeddings of shape (batch, num_context_patches, d_model)
         input_embeds: torch.Tensor = self.input_patch_embedding(patched_context)
 
-        if bin_centers is not None:
-            import math
-            # 1. Normalization
-            norm_centers = (bin_centers.float() - 2.0) / (54.0 - 2.0)  # In the implementation, 2 is the LoS path
-            norm_centers = torch.clamp(norm_centers, 0.0, 1.0)
+        # if bin_centers is not None:
+        #     import math
+        #     # 1. Normalization
+        #     norm_centers = (bin_centers.float() - 2.0) / (54.0 - 2.0)  # In the implementation, 2 is the LoS path
+        #     norm_centers = torch.clamp(norm_centers, 0.0, 1.0)
 
-            # 2. Spectral Expansion
-            k_exp = torch.pow(2.0, torch.arange(10, device=bin_centers.device, dtype=torch.float32))
+        #     # 2. Spectral Expansion
+        #     k_exp = torch.pow(2.0, torch.arange(10, device=bin_centers.device, dtype=torch.float32))
 
-            # PerceptAlign uses pi * p * 2^k
-            angle = math.pi * norm_centers.unsqueeze(1) * k_exp.unsqueeze(0)
-            geom_features = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1) # [BS, 20]
+        #     # PerceptAlign uses pi * p * 2^k
+        #     angle = math.pi * norm_centers.unsqueeze(1) * k_exp.unsqueeze(0)
+        #     geom_features = torch.cat([torch.sin(angle), torch.cos(angle)], dim=-1) # [BS, 20]
             
-            # 3. Geometry Projector
-            geom_embeds = self.geometry_projector(geom_features)
+        #     # 3. Geometry Projector
+        #     geom_embeds = self.geometry_projector(geom_features) # [BS, d_model]
             
-            # 5. Integration
-            input_embeds = input_embeds + geom_embeds.unsqueeze(1)
+        #     # 5. Integration
+        #     input_embeds = input_embeds + geom_embeds.unsqueeze(1)
+        if raw_geometry is not None:
+            geom_embeds = self.geometry_encoder(raw_geometry)
 
+            input_embeds = (
+                input_embeds
+                + geom_embeds.unsqueeze(1)
+            )
         # append [REG] special token embedding, if needed
         if self.chronos_config.use_reg_token:
             reg_input_ids = torch.full((batch_size, 1), self.config.reg_token_id, device=input_embeds.device)
@@ -946,6 +1062,7 @@ class Chronos2ModelClassification(Chronos2Model):
         output_attentions: bool = False,
         labels=None,
         bin_centers=None,
+        raw_geometry=None,
     ) -> Chronos2Output:
         """Forward pass of the Chronos2 model.
 
@@ -1029,6 +1146,7 @@ class Chronos2ModelClassification(Chronos2Model):
             future_target_mask=future_target_mask,
             output_attentions=output_attentions,
             bin_centers=bin_centers,
+            raw_geometry=raw_geometry
         )
         # loc_scale is the scaling parameters (bs, 2);
         loc_scale_tensor = torch.cat(loc_scale, dim=-1)
@@ -1109,6 +1227,129 @@ class Chronos2ModelClassification(Chronos2Model):
             logits=logits,
             embeddings=combined_features_with_statistics,
         )
+
+
+class Chronos2ModelClassificationJoint(Chronos2ModelClassification):
+    """
+    Joint whole-room occupancy classification.
+
+    Differs from `Chronos2ModelClassification` only in how the encoder output is consumed.
+    The caller puts every variate of a room-window into ONE group, so all desks attend to
+    each other through all encoder layers (early fusion) rather than being encoded in
+    isolation and merged afterwards. The head is then applied per desk, over that desk's
+    own `n_channels` variates:
+
+        [sum_b D_b * C, feat] --view--> [sum_b D_b, final_dim] --head--> [sum_b D_b, n_cls]
+
+    Two consequences worth stating, because they are the point of the design:
+      * `final_dim` is unchanged from the per-desk model, so weights (including a
+        fine-tuned classification head) load straight across and the joint model can be
+        warm-started from a per-desk checkpoint.
+      * no parameter depends on the desk count, so a model trained on 6-desk rooms runs
+        unmodified on a 4-desk room. Desk identity reaches the model only through
+        `raw_geometry` (real coordinates), never through an index or a slot.
+
+    Logits/labels are returned padded to D_max per item ([B, D_max, ...]) purely so the
+    HF Trainer sees a rectangular tensor whose first dim is the number of dataset items;
+    the encoder itself never sees a padded variate.
+    """
+
+    def forward(
+        self,
+        context: torch.Tensor,
+        context_mask: torch.Tensor | None = None,
+        group_ids: torch.Tensor | None = None,
+        future_covariates: torch.Tensor | None = None,
+        future_covariates_mask: torch.Tensor | None = None,
+        num_output_patches: int = 1,
+        future_target: torch.Tensor | None = None,
+        future_target_mask: torch.Tensor | None = None,
+        output_attentions: bool = False,
+        labels=None,
+        bin_centers=None,
+        raw_geometry=None,
+        desk_counts=None,
+    ) -> Chronos2ClassificationOutput:
+        batch_size = context.shape[0]
+
+        encoder_outputs, loc_scale, num_context_patches, patch_stats = self.encode(
+            context=context,
+            context_mask=context_mask,
+            group_ids=group_ids,
+            future_covariates=future_covariates,
+            future_covariates_mask=future_covariates_mask,
+            num_output_patches=num_output_patches,
+            future_target=future_target,
+            future_target_mask=future_target_mask,
+            output_attentions=output_attentions,
+            bin_centers=bin_centers,
+            raw_geometry=raw_geometry,
+        )
+
+        loc_scale_tensor = torch.cat(loc_scale, dim=-1)
+        patch_stats = patch_stats.view(batch_size, -1)
+
+        pooled = [torch.mean(layer, dim=1) for layer in encoder_outputs.all_hidden_states]
+        combined_features = torch.cat(pooled, dim=-1) if self.output_all_hidden_states else pooled[-1]
+
+        # [sum_b D_b * C, per_variate_feat]
+        per_variate = torch.cat([combined_features, loc_scale_tensor, patch_stats], dim=1)
+
+        if per_variate.numel() % self.final_dim != 0:
+            raise ValueError(
+                f"Cannot regroup {tuple(per_variate.shape)} variate features into desks of "
+                f"final_dim={self.final_dim}. Expected the collate to emit variates ordered "
+                f"(sample, desk, channel) with n_channels={self.n_channels} per desk."
+            )
+        # [sum_b D_b, final_dim]: n_channels consecutive variates = one desk
+        per_desk = per_variate.reshape(-1, self.final_dim)
+
+        logits_flat = self.classification_head(per_desk)  # [sum_b D_b, n_classes]
+
+        # --- rectangular [B, D_max, ...] view for the Trainer -------------------
+        if desk_counts is None:
+            # single-room-shape fallback: infer a uniform desk count
+            n_groups = len(torch.unique(group_ids)) if group_ids is not None else 1
+            desk_counts = torch.full(
+                (n_groups,), per_desk.shape[0] // max(1, n_groups),
+                dtype=torch.long, device=per_desk.device,
+            )
+        desk_counts = desk_counts.to(per_desk.device)
+        n_rooms = desk_counts.shape[0]
+        d_max = int(desk_counts.max().item())
+
+        # True where a desk slot is a real desk (as opposed to right-padding)
+        real_desk = (
+            torch.arange(d_max, device=per_desk.device)[None, :] < desk_counts[:, None]
+        )
+        if int(real_desk.sum().item()) != per_desk.shape[0]:
+            raise ValueError(
+                f"desk_counts sum to {int(real_desk.sum().item())} desks but the encoder "
+                f"produced {per_desk.shape[0]}."
+            )
+
+        logits = logits_flat.new_zeros(n_rooms, d_max, self.num_classes)
+        logits[real_desk] = logits_flat
+
+        loss = None
+        if labels is not None:
+            if labels.dim() == 1:
+                labels = labels.view(n_rooms, d_max)
+            # -100 marks both right-padding and desks deliberately left unsupervised
+            labels_flat = labels[real_desk]
+            supervised = labels_flat != -100
+            if supervised.any():
+                train_loss_type = self.chronos_config.__dict__.get("train_loss", "cross_entropy")
+                loss_fct = (
+                    BinaryFocalLoss(alpha=0.25, gamma=2.0)
+                    if train_loss_type == "focal_loss"
+                    else nn.CrossEntropyLoss()
+                )
+                loss = loss_fct(logits_flat[supervised], labels_flat[supervised].long())
+            else:
+                loss = logits_flat.sum() * 0.0
+
+        return Chronos2ClassificationOutput(loss=loss, logits=logits, embeddings=None)
 
 class Chronos2ModelClassificationMultiDesk(Chronos2Model):
     def __init__(self, config, **kwargs):
