@@ -1026,7 +1026,9 @@ class SyntheticSignalDataset(Dataset):
                  random_starting_index: bool = False,
                  mirroring_room: bool = False,
                  gaussian_noise: bool = False,
-                 ghost_augment: bool = True):
+                 ghost_augment: bool = True,
+                 max_range_gating_offset: int = 1,
+                 random_walking_blackout: bool = True):
         """
         Args:
             manifest: Populated DataManifest.
@@ -1091,6 +1093,8 @@ class SyntheticSignalDataset(Dataset):
         self.mirroring_room = mirroring_room
         self.gaussian_noise = gaussian_noise
         self.ghost_augment = ghost_augment
+        self.max_range_gating_offset = max_range_gating_offset
+        self.random_walking_blackout = random_walking_blackout
 
         # --- Mode Switching ---
         if synthesis_mode:
@@ -1351,7 +1355,8 @@ class SyntheticSignalDataset(Dataset):
         half_width = self.range_gating_width // 2
         
         if self.augment_range_gating_offset:
-            offsets = np.random.randint(-1, 2, size=synthesized_signal.shape[0])
+            # offsets = np.random.randint(-self.max_range_gating_offset, self.max_range_gating_offset+1, size=synthesized_signal.shape[0])
+            offsets = [self.max_range_gating_offset] * 4
         else:
             offsets = np.zeros(synthesized_signal.shape[0], dtype=int)
             
