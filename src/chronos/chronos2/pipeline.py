@@ -44,6 +44,47 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _shutdown_trainer_dataloaders(trainer) -> None:
+    """Close this Trainer's existing workers before Python's atexit cleanup.
+
+    Persistent, pinned-memory loaders register one atexit callback per worker.
+    Those callbacks can each wait five seconds if the loader is still alive.
+    Shut down the iterators normally instead, after *all* evaluation and saving.
+    PyTorch has no public DataLoader.close(); keep its private shutdown API here,
+    guarded for loaders/versions without multiprocessing iterators.
+    Never construct a loader or unregister the global worker-exit callbacks.
+    """
+    handler = getattr(trainer, "callback_handler", None)
+    loaders = [getattr(handler, name, None) for name in ("train_dataloader", "eval_dataloader")]
+    loaders.extend(getattr(trainer, "_eval_dataloaders", {}).values())
+    loaders.extend(getattr(getattr(trainer, "accelerator", None), "_dataloaders", []))
+    seen = set()
+    for loader in loaders:
+        if loader is None or id(loader) in seen:
+            continue
+        seen.add(id(loader))
+        # Accelerate wraps a torch DataLoader; close/reset the underlying iterator,
+        # not an attribute on the wrapper that would shadow __getattr__ delegation.
+        base = getattr(loader, "base_dataloader", None)
+        if base is not None:
+            loaders.append(base)
+            continue
+        iterator = getattr(loader, "_iterator", None)
+        if iterator is None:
+            continue
+        shutdown = getattr(iterator, "_shutdown_workers", None)
+        if not callable(shutdown):
+            logger.warning("DataLoader iterator has no worker shutdown method; leaving normal cleanup in place")
+            continue
+        try:
+            shutdown()
+            loader._iterator = None
+        except Exception:
+            # Cleanup must not hide the original training/evaluation exception.
+            # The normal PyTorch exit callbacks remain available as a fallback.
+            logger.warning("Could not shut down DataLoader workers early", exc_info=True)
+
+
 def _infer_dataset_n_channels(model_n_channels: int, dataset_kwargs: dict) -> int:
     raw_n_channels = dataset_kwargs.get("raw_n_channels")
     if raw_n_channels is not None:
@@ -259,7 +300,8 @@ def _people_count_metrics(eval_meta, labels, predictions, *, output_dir,
         e["est"] += int(pred)
         e["gt"] += int(lab)
 
-    complete = [e for e in segs.values() if len(e["seen"]) == e["n_desks"]]
+    complete_items = [(k, e) for k, e in segs.items() if len(e["seen"]) == e["n_desks"]]
+    complete = [e for _, e in complete_items]
     if not complete:
         if should_report:
             print(f"People-count MAE: skipped -- 0 of {len(segs)} eval windows have "
@@ -272,6 +314,18 @@ def _people_count_metrics(eval_meta, labels, predictions, *, output_dir,
     mae = float(err.mean())
     exact = float((err == 0).mean())
 
+    # Evaluating several rooms at once pools them into one number, which is not
+    # what you want when the rooms are the comparison. Break it out per layout.
+    per_layout = {}
+    layouts = sorted({k[0] for k, _ in complete_items})
+    if len(layouts) > 1:
+        for lay in layouts:
+            sub = [e for k, e in complete_items if k[0] == lay]
+            e_l = np.array([abs(x["gt"] - x["est"]) for x in sub], dtype=float)
+            per_layout[f"people_mae_{lay}"] = float(e_l.mean())
+            per_layout[f"people_exact_{lay}"] = float((e_l == 0).mean())
+            per_layout[f"people_windows_{lay}"] = float(len(sub))
+
     if should_report:
         lines = [f"windows: {len(complete)} complete of {len(segs)}",
                  f"MAE: {mae:.4f} people    exact-count accuracy: {exact:.4f}",
@@ -280,6 +334,13 @@ def _people_count_metrics(eval_meta, labels, predictions, *, output_dir,
             sel = gt == t
             lines.append(f"{t:6d} {int(sel.sum()):5d} {float((err[sel]==0).mean()):8.3f} "
                          f"{float(err[sel].mean()):8.3f} {float(est[sel].mean()):9.2f}")
+        if per_layout:
+            lines.append("")
+            lines.append(f"{'layout':>14s} {'windows':>8s} {'MAE':>8s} {'exact':>8s}")
+            for lay in layouts:
+                lines.append(f"{lay:>14s} {int(per_layout[f'people_windows_{lay}']):8d} "
+                             f"{per_layout[f'people_mae_{lay}']:8.4f} "
+                             f"{per_layout[f'people_exact_{lay}']:8.4f}")
         table = "\n".join(lines)
         print(f"People-count (capacity) estimation:\n{table}", flush=True)
         try:
@@ -291,7 +352,7 @@ def _people_count_metrics(eval_meta, labels, predictions, *, output_dir,
             logger.warning(f"Could not write {filename}: {exc}")
 
     return {"people_mae": mae, "people_exact": exact,
-            "people_windows": float(len(complete))}
+            "people_windows": float(len(complete)), **per_layout}
 
 
 def _dump_eval_predictions(eval_meta, labels, predictions, probs, *, output_dir,
@@ -871,6 +932,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             range_gating_width=dataset_kwargs.get("range_gating_width", 5),
             augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
             desk=dataset_kwargs.get("training_desks"),
+            # Link subset: selects channels of the .npy AND, in the collate, the
+            # matching bin-centre / geometry rows.
+            channel_subset=dataset_kwargs.get("channel_subset"),
             random_starting_index=True,
             mirroring_room=True, # if True, doubling the dataset with channel 1 and 3 swap (if both this one and training aug are true: 8x)
         )
@@ -982,6 +1046,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 range_gating_width=dataset_kwargs.get("range_gating_width", 5),
                 augment_range_gating_offset=False,
                 desk=dataset_kwargs.get("testing_desks"),
+                # Link subset: selects channels of the .npy AND, in the collate, the
+                # matching bin-centre / geometry rows.
+                channel_subset=dataset_kwargs.get("channel_subset"),
             )
 
             # set validation parameters
@@ -1180,6 +1247,7 @@ class Chronos2Pipeline(BaseChronosPipeline):
         dataloader_persistent_workers: bool | None = None,
         dataloader_prefetch_factor: int | None = None,
         dataloader_pin_memory: bool = True,
+        export_final_results: bool = False,
         # Seeds the Trainer itself (batch order + augmentation),
         # not just the model init the caller already seeded.
         seed: int = 42,
@@ -1354,6 +1422,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
             range_gating_width=dataset_kwargs.get("range_gating_width", 5),
             augment_range_gating_offset=dataset_kwargs.get("train_augment_range_gating_offset", True),
             desk=dataset_kwargs.get("training_desks"),
+            # Link subset: selects channels of the .npy AND, in the collate, the
+            # matching bin-centre / geometry rows.
+            channel_subset=dataset_kwargs.get("channel_subset"),
             random_starting_index=False,
             # if True, doubles the dataset with a link 1<->3 swap (8x when layout aug is on too)
             mirroring_room=dataset_kwargs.get("mirror_room", False),
@@ -1484,6 +1555,9 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 range_gating_width=dataset_kwargs.get("range_gating_width", 5),
                 augment_range_gating_offset=dataset_kwargs.get("test_augment_range_gating_offset", False),
                 desk=dataset_kwargs.get("testing_desks"),
+                # Link subset: selects channels of the .npy AND, in the collate, the
+                # matching bin-centre / geometry rows.
+                channel_subset=dataset_kwargs.get("channel_subset"),
             )
 
             # set validation parameters
@@ -1505,6 +1579,8 @@ class Chronos2Pipeline(BaseChronosPipeline):
                 callbacks.append(EvaluateAndSaveFinalStepCallback()) # comment out to disable final step model saving
 
         training_kwargs.update(extra_trainer_kwargs)
+        if export_final_results and training_kwargs["load_best_model_at_end"]:
+            raise ValueError("export_final_results requires load_best_model_at_end=False (use save=False)")
 
         if training_kwargs["tf32"]:
             # setting tf32=True changes these global properties, we copy them here so that
@@ -1729,6 +1805,35 @@ class Chronos2Pipeline(BaseChronosPipeline):
                     metric_prefix="occ_", should_report=should_report,
                     wandb_table_key="occupancy_stats" if "wandb" in training_args.report_to else None,
                 ))
+                # The same slice keyed on the room's true headcount rather than
+                # on "other desks occupied". k mixes two headcounts (a k=3
+                # window is 3 people when this desk is empty and 4 when it is
+                # occupied), so it cannot answer "how well does this do with N
+                # people in the room". n can. In a D-desk room n=0 and n=D are
+                # single-class, so only n=1..D-1 have a defined AUC.
+                per_desk_metrics.update(_emit_breakdown(
+                    title="Evaluation stats by room occupancy (n = people in the room)",
+                    key_name="n_people",
+                    keys=[f"n={m['gt_occupied']}" for m in eval_meta],
+                    labels=labels_for_pred, predictions=predictions, probs=y_prob_for_slice,
+                    output_dir=output_dir, filename="npeople_stats.txt",
+                    metric_prefix="npeople_", should_report=should_report,
+                    wandb_table_key="npeople_stats" if "wandb" in training_args.report_to else None,
+                ))
+
+                # With more than one evaluation room, the pooled eval_accuracy
+                # mixes them. This reports each room on its own.
+                if len({m["layout"] for m in eval_meta}) > 1:
+                    per_desk_metrics.update(_emit_breakdown(
+                        title="Evaluation stats by room",
+                        key_name="layout",
+                        keys=[m["layout"] for m in eval_meta],
+                        labels=labels_for_pred, predictions=predictions,
+                        probs=y_prob_for_slice,
+                        output_dir=output_dir, filename="room_stats.txt",
+                        metric_prefix="room_", should_report=should_report,
+                        wandb_table_key="room_stats" if "wandb" in training_args.report_to else None,
+                    ))
 
                 # Whole-room capacity error. Returns {} for a single-desk eval;
                 # the CSV below is how those runs get combined into one later.
@@ -1763,7 +1868,10 @@ class Chronos2Pipeline(BaseChronosPipeline):
             }
 
         # fit entry point to trainer
-        collate_fn = ChronosClassificationCollate(context_length=context_length)
+        collate_fn = ChronosClassificationCollate(
+            context_length=context_length,
+            channel_subset=dataset_kwargs.get("channel_subset"),
+        )
         
         # Define a custom Trainer to use the WeightedRandomSampler
         class WeightedTrainer(Trainer):
@@ -1812,7 +1920,37 @@ class Chronos2Pipeline(BaseChronosPipeline):
         if remove_printer_callback:
             trainer.pop_callback(PrinterCallback)
 
-        trainer.train()
+        try:
+            trainer.train()
+
+            if export_final_results:
+                if validation_inputs is None:
+                    raise ValueError("export_final_results requires evaluation inputs")
+                # Fixed-budget evaluation: never choose a checkpoint or threshold on the test rooms.
+                # Reuse an evaluation only if it was performed at exactly the final step.
+                final_metrics = next((dict(row) for row in reversed(trainer.state.log_history)
+                                      if "eval_loss" in row and row.get("step") == trainer.state.global_step), None)
+                if final_metrics is None:
+                    final_metrics = trainer.evaluate()
+                trainer.save_state()
+                if trainer.is_world_process_zero():
+                    import json
+                    clean_metrics = {key: (None if isinstance(value, float) and not math.isfinite(value) else value)
+                                     for key, value in final_metrics.items() if key.startswith("eval_")}
+                    result = {
+                        "selection": "final_step",
+                        "global_step": trainer.state.global_step,
+                        "seed": seed,
+                        "train_layouts": list(train_inputs),
+                        "test_layouts": list(validation_inputs),
+                        "metrics": clean_metrics,
+                    }
+                    result_path = output_dir / "final_results.json"
+                    temporary = result_path.with_suffix(".json.tmp")
+                    temporary.write_text(json.dumps(result, indent=2, allow_nan=False) + "\n")
+                    temporary.replace(result_path)
+        finally:
+            _shutdown_trainer_dataloaders(trainer)
 
         # update context_length and max_output_patches, if the model was fine-tuned with larger values
         model.chronos_config.context_length = max(model.chronos_config.context_length, context_length)

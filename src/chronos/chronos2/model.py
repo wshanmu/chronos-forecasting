@@ -904,16 +904,20 @@ class Chronos2ModelClassification(Chronos2Model):
         self.num_classes = config.chronos_config["n_classes"]
         self.output_all_hidden_states = config.chronos_config["output_all_hidden_states"]
         self.n_channels = config.chronos_config["n_channels"]
+        self.use_geometry_features = config.chronos_config.get("use_geometry_features", True)
+        self.use_patch_stats = config.chronos_config.get("use_patch_stats", True)
         
         # Remove the forecasting head to save memory/VRAM
         del self.output_patch_embedding
         self.context_length = config.chronos_config["context_length"]
         patch_size_stats = self.chronos_config.__dict__.get("patch_size_stats", 32)
-        if self.output_all_hidden_states:
-            self.final_dim = (self.model_dim * 12 + 2) * self.n_channels  
-        else:
-            self.final_dim = (self.model_dim + 2 + self.context_length//patch_size_stats * 4) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
-            # self.final_dim = (self.model_dim + 2) * self.n_channels # (model_dim + instance_norm feature + patch_stats) * num_channel
+        patch_stride_stats = self.chronos_config.patch_stride_stats
+        # Match Patch.forward's left padding and unfold, including overlapping patches.
+        padded_length = ((self.context_length + patch_size_stats - 1) // patch_size_stats) * patch_size_stats
+        n_stats_patches = (padded_length - patch_size_stats) // patch_stride_stats + 1
+        hidden_dim = self.model_dim * (config.num_layers if self.output_all_hidden_states else 1)
+        stats_dim = 4 * n_stats_patches if self.use_patch_stats else 0
+        self.final_dim = (hidden_dim + 2 + stats_dim) * self.n_channels
         self.classification_head = nn.Sequential(
             nn.Linear(self.final_dim, 512),
             nn.ReLU(),
@@ -994,9 +998,12 @@ class Chronos2ModelClassification(Chronos2Model):
         )
 
         batch_size = context.shape[0]
-        patched_context, attention_mask, loc_scale, patch_stats = self._prepare_patched_context(
-            context=context, context_mask=context_mask, return_patch_stats=True
+        prepared = self._prepare_patched_context(
+            context=context, context_mask=context_mask, return_patch_stats=self.use_patch_stats
         )
+        patched_context, attention_mask, loc_scale = prepared[:3]
+        # An empty feature tensor keeps both per-desk and joint forward paths compatible.
+        patch_stats = prepared[3] if self.use_patch_stats else context.new_empty((batch_size, 0))
         num_context_patches = attention_mask.shape[-1]
 
         # get input embeddings of shape (batch, num_context_patches, d_model)
@@ -1020,7 +1027,7 @@ class Chronos2ModelClassification(Chronos2Model):
             
         #     # 5. Integration
         #     input_embeds = input_embeds + geom_embeds.unsqueeze(1)
-        if raw_geometry is not None:
+        if self.use_geometry_features and raw_geometry is not None:
             geom_embeds = self.geometry_encoder(raw_geometry)
 
             input_embeds = (

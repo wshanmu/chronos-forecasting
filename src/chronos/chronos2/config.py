@@ -118,6 +118,8 @@ class Chronos2ForecastingConfig:
     n_channels: int = 8
     simclr_temperature: float = 0.2
     num_frequencies: int = 6
+    use_geometry_features: bool = True
+    use_patch_stats: bool = True
 
     @classmethod
     def editable_fields(cls) -> list[str]:

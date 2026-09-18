@@ -89,6 +89,32 @@ estimated_tap_dict = {
 # estimated_tap_dict order, exactly as provided:
 #   node0-1, node1-3, node2-3, node0-2
 TAP_PAIR_ORDER = ((0, 1), (1, 3), (2, 3), (0, 2))
+
+# The 6-channel captures add the two diagonals to the four perimeter links, in
+# this order. Confirmed against the recorded taps in
+# ChronosClassificationCollate.deployment_dict_6channel: estimating each desk's
+# XYZ from its four perimeter taps and predicting the excess path for every
+# candidate node pair matches (0, 3) for channel 4 (mean |error| 0.31 taps) and
+# (1, 2) for channel 5 (0.38), against 15.5-18.3 for every other pairing.
+TAP_PAIR_ORDER_6 = TAP_PAIR_ORDER + ((0, 3), (1, 2))
+
+# n_links -> link definition. Keyed by length so callers can simply pass whatever
+# tap vector the dataset has.
+TAP_PAIR_ORDER_BY_LEN = {
+    len(TAP_PAIR_ORDER): TAP_PAIR_ORDER,
+    len(TAP_PAIR_ORDER_6): TAP_PAIR_ORDER_6,
+}
+
+
+def resolve_tap_pair_order(n_taps: int) -> tuple[tuple[int, int], ...]:
+    """Link (node-pair) order for a tap vector of this length."""
+    try:
+        return TAP_PAIR_ORDER_BY_LEN[int(n_taps)]
+    except KeyError:
+        raise ValueError(
+            f"No link order defined for {n_taps} taps; known: "
+            f"{sorted(TAP_PAIR_ORDER_BY_LEN)}"
+        ) from None
 TAP_TO_EXCESS_LENGTH_M = 0.3002 / 2.0
 RAW_GEOMETRY_COLUMNS = (
     "baseline_m",
@@ -499,8 +525,17 @@ def estimate_desk_xyz_from_node_taps(
     """Estimate desk XYZ from four bistatic tap indices and node coordinates."""
     nodes = coerce_node_xyz(node_xyz)
     taps = np.asarray(tap_indices, dtype=float)
-    if taps.shape != (len(TAP_PAIR_ORDER),):
-        raise ValueError(f"tap_indices must have shape ({len(TAP_PAIR_ORDER)},), found {taps.shape}")
+    if taps.ndim != 1 or len(taps) not in TAP_PAIR_ORDER_BY_LEN:
+        raise ValueError(
+            f"tap_indices must be 1-D with length in {sorted(TAP_PAIR_ORDER_BY_LEN)}, "
+            f"found shape {taps.shape}"
+        )
+    # solve_position_from_taps is written against the four perimeter links. A
+    # 6-tap vector is a superset whose first four entries ARE those links, so the
+    # position is solved from them and the extra diagonals are used only to
+    # describe the additional links afterwards. This keeps the estimated desk XYZ
+    # bit-identical between the 4- and 6-channel datasets.
+    taps = taps[:len(TAP_PAIR_ORDER)]
 
     if desk_z_prior_m is None:
         desk_z_prior_m = max(0.0, float(np.min(nodes[:, 2]) - 2.0))
@@ -527,11 +562,16 @@ def compute_geometry_features_from_node_taps(
     *,
     desk_z_prior_m: float | None = None,
 ) -> np.ndarray:
-    """Return invariant geometry features with shape [4 links, 5 features]."""
+    """Return invariant geometry features with shape [n_links, 5 features].
+
+    n_links follows the length of `tap_indices`: 4 for the perimeter-only
+    captures, 6 when the diagonals are present. Row i describes the link named by
+    resolve_tap_pair_order(n_links)[i], so the row order matches the channel order
+    of the signal and a channel subset can index both with the same list.
+    """
     nodes = coerce_node_xyz(node_xyz)
     taps = np.asarray(tap_indices, dtype=float)
-    if taps.shape != (len(TAP_PAIR_ORDER),):
-        raise ValueError(f"tap_indices must have shape ({len(TAP_PAIR_ORDER)},), found {taps.shape}")
+    pair_order = resolve_tap_pair_order(len(taps))
 
     desk_xyz = estimate_desk_xyz_from_node_taps(
         nodes,
@@ -541,7 +581,7 @@ def compute_geometry_features_from_node_taps(
     raw_geometry, _ = compute_symmetric_link_geometry(
         scene_xyz=desk_xyz[None, :],
         node_xyz=nodes,
-        link_index=np.asarray(TAP_PAIR_ORDER, dtype=int),
+        link_index=np.asarray(pair_order, dtype=int),
     )
     features = raw_geometry[0]
     features[:, 1] = taps * TAP_TO_EXCESS_LENGTH_M

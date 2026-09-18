@@ -671,8 +671,12 @@ class Chronos2Dataset(IterableDataset):
 
 
 class ChronosClassificationCollate:
-    def __init__(self, context_length: int, deployment_dict: Optional[Dict] = None):
+    def __init__(self, context_length: int, deployment_dict: Optional[Dict] = None,
+                 channel_subset: Optional[List[int]] = None):
         self.context_length = context_length
+        # NOTE: the literal below has always overwritten anything passed in via
+        # `deployment_dict`. Kept as-is so existing callers are unaffected;
+        # `channel_subset` is the supported way to change the link set.
         self.deployment_dict = deployment_dict or {}
         self.deployment_dict = {
         "deployment7": {
@@ -703,6 +707,51 @@ class ChronosClassificationCollate:
             '3': [24, 20, 14, 32],
             '4': [12, 20, 28, 35]
         }}
+
+        self.deployment_dict_6channel = {
+        "deployment7": {
+            '1': [20, 25, 42, 12, 7, 10], #
+            '2': [20, 13, 41, 22, 8, 6], #
+            '3': [33, 25, 28, 11, 8, 7], #
+            '4': [31, 12, 28, 22, 7, 7], #
+            '5': [49, 25, 16, 14, 11, 8], # 
+            '6': [48, 13, 16, 25, 8, 11], #
+        },
+        "deployment8": {
+            '1': [13, 30, 44, 20, 7, 10], 
+            '2': [13, 20, 43, 29, 9, 7], #
+            '3': [24, 29, 28, 16, 6, 6], #
+            '4': [23, 18, 29, 27, 6, 5], # 
+            '5': [39, 30, 16, 18, 8, 6], # 
+            '6': [40, 19, 15, 29, 6, 8], # 
+        },
+        "deployment9": {
+            '1': [12, 37, 27, 19, 6, 8],
+            '2': [12, 22, 26, 32, 7, 6],
+            '3': [25, 36, 14, 19, 7, 6],
+            '4': [24, 21, 14, 33, 6, 7]
+        },
+        "deployment10": {
+            '1': [23, 33, 14, 21, 7, 6],
+            '2': [12, 34, 27, 21, 6, 8],
+            '3': [24, 20, 14, 32, 6, 8],
+            '4': [12, 20, 28, 35, 8, 6]
+        },
+    }
+        # A channel subset indexes the 6-link tap table; without one we stay on
+        # the 4-link perimeter table, so the default path is untouched.
+        self.channel_subset = list(channel_subset) if channel_subset else None
+        if self.channel_subset is not None:
+            n_src = len(next(iter(self.deployment_dict_6channel.values()))['1'])
+            bad = [c for c in self.channel_subset if not 0 <= c < n_src]
+            if bad:
+                raise ValueError(
+                    f"channel_subset {self.channel_subset} out of range for "
+                    f"{n_src} channels (offending: {bad})")
+            self.deployment_dict = self.deployment_dict_6channel
+        self.n_links = (len(self.channel_subset) if self.channel_subset
+                        else len(next(iter(self.deployment_dict.values()))['1']))
+
         self.feature_lookup = generate_geometry_feature_lookup(
             node_coordinates_by_layout=node_coordinate_dict,
             deployment_dict=self.deployment_dict,
@@ -767,14 +816,24 @@ class ChronosClassificationCollate:
             # an in-place swap here would corrupt the entry for every later sample.
             geo_features = np.array(geo_features, copy=True)
 
+            # Take the selected links from BOTH the bin centres and the geometry
+            # rows, with the same index list, before any permutation below.
+            if self.channel_subset is not None:
+                base_centers = base_centers[self.channel_subset]
+                geo_features = geo_features[self.channel_subset]
+
             # `_finalize_signal` applies the mirror swap and then the layout roll to
             # the LINK axis of the signal. bin_centers and raw_geometry are indexed by
             # that same link axis, so all three must receive the identical permutation
             # or the model is told the wrong link identity for a transformed sample.
             if is_mirrored and len(base_centers) > 3:
+                if self.channel_subset is not None:
+                    raise ValueError("mirroring is not defined for a channel subset")
                 base_centers[[1, 3]] = base_centers[[3, 1]]
                 geo_features[[1, 3]] = geo_features[[3, 1]]
 
+            if shift > 0 and self.channel_subset is not None:
+                raise ValueError("the layout roll is not defined for a channel subset")
             if shift > 0:
                 base_centers = np.roll(base_centers, shift)
                 geo_features = np.roll(geo_features, shift, axis=0)
@@ -791,11 +850,14 @@ class ChronosClassificationCollate:
         # Convert to tensor and flatten to match Group IDs
         if batch_bin_centers: # list len: B, element: (4,)
             geo_raw_feature = torch.tensor(np.array(batch_geometry_features), dtype=torch.float32) # [B, 4, 5]
-            geo_raw_feature = geo_raw_feature.view(-1, 5) # [B*4, 5]
-            geo_raw_feature = geo_raw_feature.repeat_interleave(N//4, dim=0)
-            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32) # [B, 4] - need to duplicate twice (I/Q)
-            bin_centers_tensor = bin_centers_tensor.view(-1) # [B*4]
-            bin_centers_tensor = bin_centers_tensor.repeat_interleave(N//4)
+            geo_raw_feature = geo_raw_feature.view(-1, 5) # [B*L, 5]
+            # N is channels-after-I/Q-stacking; N // n_links is that stack factor
+            # (2 for I_Q / mag_phase, 1 otherwise). Hardcoding 4 here silently
+            # mismatched geometry to series for any link count other than four.
+            geo_raw_feature = geo_raw_feature.repeat_interleave(N//self.n_links, dim=0)
+            bin_centers_tensor = torch.tensor(np.array(batch_bin_centers), dtype=torch.float32) # [B, L]
+            bin_centers_tensor = bin_centers_tensor.view(-1) # [B*L]
+            bin_centers_tensor = bin_centers_tensor.repeat_interleave(N//self.n_links)
         else:
             bin_centers_tensor = torch.empty(0, dtype=torch.float32)
 
@@ -1051,7 +1113,8 @@ class SyntheticSignalDataset(Dataset):
                  random_starting_index: bool = False,
                  mirroring_room: bool = False,
                  gaussian_noise: bool = False,
-                 ghost_augment: bool = True):
+                 ghost_augment: bool = True,
+                 channel_subset: Optional[List[int]] = None):
         """
         Args:
             manifest: Populated DataManifest.
@@ -1090,6 +1153,37 @@ class SyntheticSignalDataset(Dataset):
                 If None, uses all. If a layout's list is empty ([]), uses all for that layout.
         """
         self.n_channels = n_channels
+        # Channel == LINK. The .npy channel axis is ordered by
+        # geometry_embedding.resolve_tap_pair_order(n), so selecting channels
+        # selects node pairs, and the bin centres and geometry rows in the collate
+        # must be indexed with the SAME list or the model is handed the wrong link
+        # identity for each series.
+        self.channel_subset = list(channel_subset) if channel_subset else None
+        # Indexes the channel axis on load. A plain slice when unset, so the
+        # no-subset path stays byte-identical to before this change.
+        self._channel_index = (np.asarray(self.channel_subset, dtype=int)
+                               if self.channel_subset else slice(None))
+        if self.channel_subset is not None:
+            # The mirror swap in _finalize_signal is the perimeter-order
+            # permutation (link 1 <-> link 3) and the layout roll assumes a cyclic
+            # link order. Under an arbitrary subset neither is meaningful, so
+            # refuse rather than silently permute the wrong rows.
+            if mirroring_room:
+                raise ValueError(
+                    "mirroring_room is not supported with channel_subset: the "
+                    "1<->3 swap is defined on the 4-link perimeter order.")
+            # Only the flag for the mode that actually builds recipes matters:
+            # _build_training_recipes reads aug_layout_training (synthesis_mode
+            # True), _build_testing_recipes reads aug_layout_testing. The eval
+            # dataset is constructed without aug_layout_training, so it inherits
+            # the True default even though nothing reads it -- checking both here
+            # would reject every evaluation set.
+            roll_flag = aug_layout_training if synthesis_mode else aug_layout_testing
+            if roll_flag:
+                which = "aug_layout_training" if synthesis_mode else "aug_layout_testing"
+                raise ValueError(
+                    f"{which} (the cyclic link roll) is not supported with "
+                    "channel_subset: the roll assumes a cyclic link order.")
         self.window_size = window_size
         self.stride = stride
         self.stack_complex = stack_complex
@@ -1433,7 +1527,7 @@ class SyntheticSignalDataset(Dataset):
             if start_idx == -1:
                 start_idx = np.random.randint(0, max(1, raw.shape[2] - self.window_size - 100))
             end_idx = start_idx + self.window_size
-            base_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
+            base_slice = raw[slice_idx, self._channel_index, start_idx:end_idx, :].copy()
             
             # 1. Time Warp once for the base segment
             if self.augment_time_warp:
@@ -1457,7 +1551,7 @@ class SyntheticSignalDataset(Dataset):
                     if neg_start_idx == -1:
                         neg_start_idx = np.random.randint(0, max(1, neg_raw.shape[2] - self.window_size - 100))
                     neg_end = neg_start_idx + self.window_size
-                    neg_slice = neg_raw[slice_idx, :, neg_start_idx:neg_end, :].copy()
+                    neg_slice = neg_raw[slice_idx, self._channel_index, neg_start_idx:neg_end, :].copy()
                     
                     if self.augment_time_warp:
                         neg_slice = self._apply_time_warp(neg_slice, strength=self.time_warp_strength)
@@ -1513,7 +1607,7 @@ class SyntheticSignalDataset(Dataset):
             if start_idx == -1:
                 start_idx = np.random.randint(0, max(1, raw.shape[2] - self.window_size - 100))
             end_idx = start_idx + self.window_size
-            signal_slice = raw[slice_idx, :, start_idx:end_idx, :].copy()
+            signal_slice = raw[slice_idx, self._channel_index, start_idx:end_idx, :].copy()
 
             if self.augment_phase: 
                 step = self.augment_phase_step
