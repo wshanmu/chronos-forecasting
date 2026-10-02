@@ -706,7 +706,20 @@ class ChronosClassificationCollate:
             '2': [12, 34, 27, 21],
             '3': [24, 20, 14, 32],
             '4': [12, 20, 28, 35]
-        }}
+        },
+        "deployment11": {
+            '1': [15, 32, 25, 18],
+            '2': [14, 20, 25, 30],
+            '3': [27, 34, 12, 19],
+            '4': [26, 22, 12, 32]
+        },
+        "deployment12": {
+            '1': [13, 32, 26, 17],
+            '2': [12, 19, 25, 32],
+            '3': [25, 35, 13, 18],
+            '4': [26, 19, 13, 33]
+        },
+        }
 
         self.deployment_dict_6channel = {
         "deployment7": {
@@ -1105,6 +1118,7 @@ class SyntheticSignalDataset(Dataset):
                  blending_alpha_enabled: bool = True,
                  blending_alpha_range: Tuple[float, float] = (0.1, 1.1),
                  min_max_normalization: bool = True,
+                 mean_subtraction: bool = False,
                  convert_complex_to_float: str = "I_Q",
                  range_gating_width: int = 5,
                  augment_range_gating_offset: bool = False,
@@ -1201,6 +1215,7 @@ class SyntheticSignalDataset(Dataset):
         self.recipes: List[Recipe] = []
         self.neg_pools = {}
         self.min_max_normalization = min_max_normalization
+        self.mean_subtraction = mean_subtraction
         self.range_gating_width = range_gating_width
         self.augment_range_gating_offset = augment_range_gating_offset
         self.manifest = manifest
@@ -1489,6 +1504,8 @@ class SyntheticSignalDataset(Dataset):
 
         if self.min_max_normalization:
             synthesized_signal = self.min_max_norm(synthesized_signal)
+        if self.mean_subtraction:
+            synthesized_signal = synthesized_signal - np.mean(synthesized_signal, axis=-1, keepdims=True)
 
         if self.stack_complex:
             if self.convert_complex_to_float == "mag_phase":
