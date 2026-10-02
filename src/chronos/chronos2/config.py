@@ -120,6 +120,7 @@ class Chronos2ForecastingConfig:
     num_frequencies: int = 6
     use_geometry_features: bool = True
     use_patch_stats: bool = True
+    use_cross_link_attention: bool = True
 
     @classmethod
     def editable_fields(cls) -> list[str]:

@@ -906,6 +906,9 @@ class Chronos2ModelClassification(Chronos2Model):
         self.n_channels = config.chronos_config["n_channels"]
         self.use_geometry_features = config.chronos_config.get("use_geometry_features", True)
         self.use_patch_stats = config.chronos_config.get("use_patch_stats", True)
+        self.use_cross_link_attention = config.chronos_config.get("use_cross_link_attention", True)
+        if not self.use_cross_link_attention and (self.n_channels < 2 or self.n_channels % 2):
+            raise ValueError("I/Q-only attention requires an even n_channels (adjacent I/Q pairs)")
         
         # Remove the forecasting head to save memory/VRAM
         del self.output_patch_embedding
@@ -1047,10 +1050,24 @@ class Chronos2ModelClassification(Chronos2Model):
             # by default, each time series is treated independently, i.e., no mixing across the batch
             group_ids = torch.arange(batch_size, dtype=torch.long, device=self.device)
 
+        # Keep the caller's sample IDs intact for the classification head. Only
+        # the encoder receives link IDs: [I0,Q0,I1,Q1,...] -> [0,0,1,1,...].
+        # IDs span the flattened batch, so pairs never attend to another sample.
+        attention_group_ids = group_ids
+        if not self.use_cross_link_attention:
+            if batch_size % self.n_channels:
+                raise ValueError("I/Q-only attention requires complete n_channels-sized samples")
+            pair_ids = torch.arange(batch_size, device=group_ids.device) // 2
+            # Intersect with the original groups, preserving caller isolation
+            # (including the default independent-series behavior when IDs are absent).
+            _, attention_group_ids = torch.unique(
+                torch.stack((group_ids, pair_ids), dim=1), dim=0, return_inverse=True
+            )
+
         encoder_outputs: Chronos2EncoderOutput = self.encoder(
             attention_mask=attention_mask,
             inputs_embeds=input_embeds,
-            group_ids=group_ids,
+            group_ids=attention_group_ids,
             output_attentions=output_attentions,
             output_hidden_states=True,
         )
